@@ -18,17 +18,18 @@ Qué hace este panel:
   4) RIESGO & LÍMITES    → chequeo automático de los límites del IPS: banda de
                            duration objetivo, concentración máxima por emisor
                            corporativo (ON individual) y sublímite Dollar-Linked
-                           en el tramo largo.
-  5) METODOLOGÍA         → fuentes, supuestos y cómo editar la cartera.
+                           sobre el total de la cartera.
+  5) METODOLOGÍA         → fuentes y supuestos.
 
 Fuente de mercado: Alphacast, dataset 41886 (ONs / Bonos / Soberanos — el mismo
 dataset del panel PRO de Renta Fija). Los instrumentos de money-market (caución,
 FCI, cuenta remunerada) no cotizan ahí: se modelan con una TNA manual editable.
 
-La cartera de holdings (tickers y pesos) es un PUNTO DE PARTIDA reconstruido a
-partir del IPS — está pensada para editarse en vivo desde la barra lateral antes
-de mostrarla en clase. No se inventan datos de mercado: todo lo que no viene de
-Alphacast queda explícitamente marcado como manual/editable en la interfaz.
+La cartera de 8 holdings es la composición EXACTA reconciliada de los dos
+gráficos de torta del IPS (cartera consolidada + detalle de Objetivo 1): no es
+una estimación ni requiere completar instrumentos. El único dato que no sale
+de Alphacast es la TNA de la caución/money market, que se carga con un único
+número en la parte superior de la app.
 
 Requisitos: streamlit, pandas, numpy, plotly, alphacast, openpyxl
 """
@@ -124,41 +125,67 @@ CLASE_COLOR = {"CER": COLORS["cer"], "Fija": COLORS["fija"], "DL": COLORS["dl"],
 
 
 # =====================================================================
-# Cartera por defecto — reconstruida del IPS (Grupo 8, comité julio 2026)
+# Cartera por defecto — composición EXACTA del IPS (Grupo 8, comité julio 2026)
 # =====================================================================
-# NOTA PARA LA CLASE: estos tickers y pesos son un punto de partida a partir de
-# las diapositivas de "Composición" del IPS (cartera ≈ $175M; Objetivo 1 = 74%
-# / Objetivo 2 = 26%; dentro de Objetivo 1, tramos 20% / 50% / 30%). El ticker
-# de cobertura FX de Objetivo 2 y los pesos finos de cada ON quedan marcados
-# como EDITABLES: hay que completarlos con los datos reales antes de exponerlo.
+# Reconciliada a partir de los DOS gráficos de "Composición" del IPS (ver el
+# docstring de default_portfolio() para el detalle numérico). Los 8 tickers y
+# pesos son la cartera completa — no faltan instrumentos por cargar.
 
 def default_portfolio() -> pd.DataFrame:
+    """Composición EXACTA de la cartera del Grupo 8, reconciliada a partir de los
+    DOS gráficos de torta del IPS (no es una estimación):
+
+      · Slide "Cartera Consolidada ≈ $175.000.000": D31M7 79,1% · D30S6 6,9% ·
+        TZXD6 7,0% · TLCQO 2,1% · Cauciones 1,4% (suma visible 96,5%).
+      · Slide "Objetivo 1 (Capital de trabajo)": Cauciones 10% · S31L6 10% ·
+        TZXD6 50% · TLCQO 15% · LOC5O 7,5% · AO27 7,5% (100% de Objetivo 1).
+
+    D31M7 y D30S6 (Dollar-Linked) son la cobertura cambiaria del préstamo:
+    79,1% + 6,9% = 86,0% del total — coincide EXACTO con el "Sublímite 86%
+    Dollar-Linked" de la diapositiva de riesgos, y con $150M/$175M ≈ 86%.
+    Esos dos instrumentos son, por lo tanto, el 100% de Objetivo 2 → Objetivo 1
+    es el 14,0% restante del total. Aplicando ese 14,0% a los pesos del segundo
+    gráfico se obtiene el 3,5% que faltaba en el primero (S31L6 1,4% + LOC5O
+    1,05% + AO27 1,05% = 3,5%), y los tres instrumentos que sí aparecían en
+    ambos gráficos coinciden centavo a centavo (Cauciones 1,4%, TZXD6 7,0%,
+    TLCQO 2,1%). Las 8 filas de abajo son, entonces, la cartera COMPLETA —
+    no hace falta agregar ni completar ningún instrumento.
+    """
     rows = [
+        # ---- Objetivo 2 · Cobertura FX del préstamo (86,0% del total) ----
+        dict(Ticker="D31M7", Descripcion="Dollar-Linked — cobertura FX del préstamo (venc. ~mar-2027)",
+             Objetivo="2 · Cobertura FX Préstamo", Tramo="Cobertura FX (Estructural)",
+             Peso_pct=79.1, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Segmento_Manual="Sovereign", Clase_Manual="DL"),
+        dict(Ticker="D30S6", Descripcion="Dollar-Linked — cobertura FX del préstamo (venc. ~sep-2026)",
+             Objetivo="2 · Cobertura FX Préstamo", Tramo="Cobertura FX (Estructural)",
+             Peso_pct=6.9, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Segmento_Manual="Sovereign", Clase_Manual="DL"),
+        # ---- Objetivo 1 · Capital de trabajo (14,0% del total) ----
         dict(Ticker="CAUCION", Descripcion="Caución 1 día / FCI Money Market / Cta. Remunerada",
              Objetivo="1 · Capital de Trabajo", Tramo="1 · Operativo (≤1 mes)",
-             Peso_pct=14.8, Es_Cash=True, TNA_Manual_pct=30.0,
+             Peso_pct=1.4, Es_Cash=True, TNA_Manual_pct=30.0,
              Segmento_Manual="Cash", Clase_Manual="Cash"),
+        dict(Ticker="S31L6", Descripcion="LECAP corta",
+             Objetivo="1 · Capital de Trabajo", Tramo="1 · Operativo (≤1 mes)",
+             Peso_pct=1.4, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Segmento_Manual="Sovereign", Clase_Manual="Fija"),
         dict(Ticker="TZXD6", Descripcion="Bono del Tesoro Nacional — CER",
              Objetivo="1 · Capital de Trabajo", Tramo="2 · Táctico (1-12 meses)",
-             Peso_pct=37.0, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Peso_pct=7.0, Es_Cash=False, TNA_Manual_pct=np.nan,
              Segmento_Manual="Sovereign", Clase_Manual="CER"),
-        dict(Ticker="AO27", Descripcion="Bono Soberano",
+        dict(Ticker="TLCQO", Descripcion="ON corporativa",
              Objetivo="1 · Capital de Trabajo", Tramo="3 · Estructural (>1 año)",
-             Peso_pct=16.2, Es_Cash=False, TNA_Manual_pct=np.nan,
-             Segmento_Manual="Sovereign", Clase_Manual="Otro"),
+             Peso_pct=2.1, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Segmento_Manual="Corporate", Clase_Manual="HD"),
         dict(Ticker="LOC5O", Descripcion="ON Loma Negra",
              Objetivo="1 · Capital de Trabajo", Tramo="3 · Estructural (>1 año)",
-             Peso_pct=3.0, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Peso_pct=1.05, Es_Cash=False, TNA_Manual_pct=np.nan,
              Segmento_Manual="Corporate", Clase_Manual="HD"),
-        dict(Ticker="YCAMO", Descripcion="ON YPF",
+        dict(Ticker="AO27", Descripcion="Bono Soberano",
              Objetivo="1 · Capital de Trabajo", Tramo="3 · Estructural (>1 año)",
-             Peso_pct=3.0, Es_Cash=False, TNA_Manual_pct=np.nan,
-             Segmento_Manual="Corporate", Clase_Manual="HD"),
-        dict(Ticker="COMPLETAR_DL", Descripcion="ON/Bono Dollar-Linked — cobertura FX del préstamo "
-                                                 "(COMPLETAR con el ticker real antes de la clase)",
-             Objetivo="2 · Cobertura FX Préstamo", Tramo="Cobertura FX (Estructural)",
-             Peso_pct=26.0, Es_Cash=False, TNA_Manual_pct=np.nan,
-             Segmento_Manual="Sovereign", Clase_Manual="DL"),
+             Peso_pct=1.05, Es_Cash=False, TNA_Manual_pct=np.nan,
+             Segmento_Manual="Sovereign", Clase_Manual="Otro"),
     ]
     return pd.DataFrame(rows)
 
@@ -231,10 +258,12 @@ def synthetic_dataset(tickers: list, seed: int = 8, days: int = 420) -> pd.DataF
     rng = np.random.default_rng(seed)
     hoy = pd.Timestamp(datetime.now().date())
     fechas = pd.bdate_range(end=hoy, periods=days)
-    base_tir = {"CAUCION": 30.0, "TZXD6": 24.0, "AO27": 12.0, "LOC5O": 9.0,
-                "YCAMO": 8.5, "COMPLETAR_DL": 6.0}
-    base_md = {"CAUCION": 0.0, "TZXD6": 0.55, "AO27": 1.9, "LOC5O": 1.1,
-               "YCAMO": 0.9, "COMPLETAR_DL": 1.6}
+    base_tir = {"D31M7": 6.0, "D30S6": 4.0, "S31L6": 32.0, "TZXD6": 24.0,
+                "TLCQO": 9.0, "LOC5O": 9.5, "AO27": 12.0}
+    base_md = {"D31M7": 0.65, "D30S6": 0.20, "S31L6": 0.10, "TZXD6": 0.55,
+               "TLCQO": 1.0, "LOC5O": 1.1, "AO27": 1.7}
+    clase_map = {"D31M7": "DL", "D30S6": "DL", "S31L6": "Fija", "TZXD6": "CER",
+                 "TLCQO": "HD", "LOC5O": "HD", "AO27": "Otro"}
     rows = []
     for tk in tickers:
         if tk == "CAUCION":
@@ -247,10 +276,11 @@ def synthetic_dataset(tickers: list, seed: int = 8, days: int = 420) -> pd.DataF
         paridad = 100 * np.cumprod(1 + paridad_ret)
         for i, f in enumerate(fechas):
             rows.append(dict(Date=f, Ticker=tk, Emisor=tk, Segmento="Corporate" if tk in
-                              ("LOC5O", "YCAMO") else "Sovereign", CouponStructure=None,
+                              ("LOC5O", "TLCQO") else "Sovereign", CouponStructure=None,
                               TradingCcy="ARS", TIR=round(float(tir_walk[i]), 2),
                               MD=round(float(md_walk[i]), 2), Convexidad=np.nan,
-                              Paridad=round(float(paridad[i]), 2), Volumen=np.nan, Clase="Otro"))
+                              Paridad=round(float(paridad[i]), 2), Volumen=np.nan,
+                              Clase=clase_map.get(tk, "Otro")))
     return pd.DataFrame(rows)
 
 
@@ -458,53 +488,71 @@ with st.sidebar:
     st.subheader("📐 Límites del IPS (editables)")
     md_target_lo, md_target_hi = st.slider("Banda objetivo de Duration (años)", 0.0, 2.0, (0.50, 0.80), 0.01)
     limite_emisor_corp = st.number_input("Límite máx. por ON corporativa individual (%)", value=3.15, step=0.05)
-    sublimite_dl_tramo_largo = st.number_input("Sublímite Dollar-Linked en tramo largo (%)", value=86.0, step=1.0)
+    sublimite_dl_tramo_largo = st.number_input("Sublímite Dollar-Linked sobre el total (%)", value=86.0, step=1.0)
 
     st.divider()
     st.subheader("🗓️ Cronograma del préstamo")
     fecha_desembolso = st.date_input("Fecha de desembolso del préstamo", value=datetime(2026, 4, 1))
 
 # ---------------------------------------------------------------------
-# Cartera editable
+# Cartera — composición fija (según el IPS), con un único input real
 # ---------------------------------------------------------------------
 if "portfolio" not in st.session_state:
     st.session_state["portfolio"] = default_portfolio()
 
-st.subheader("✏️ Composición de la cartera (editable)")
-st.caption("Cargá acá los tickers y pesos reales del Grupo 8 antes de la clase. Las filas con **Es_Cash** "
-           "usan la TNA manual (no salen de Alphacast). El resto se busca por Ticker en el dataset 41886.")
+st.subheader("📋 Composición de la cartera (según el IPS del Grupo 8)")
+st.caption("Los 8 instrumentos y sus pesos surgen de reconciliar los dos gráficos de torta del IPS "
+           "(cartera consolidada + detalle de Objetivo 1) — no hace falta agregar ni completar nada. "
+           "El único dato que no sale de Alphacast es la tasa de la caución/money market: se carga abajo.")
 
-edited = st.data_editor(
-    st.session_state["portfolio"], num_rows="dynamic", use_container_width=True, hide_index=True,
-    column_config={
-        "Ticker": st.column_config.TextColumn("Ticker", required=True),
-        "Descripcion": st.column_config.TextColumn("Descripción", width="large"),
-        "Objetivo": st.column_config.SelectboxColumn("Objetivo",
-                     options=["1 · Capital de Trabajo", "2 · Cobertura FX Préstamo"]),
-        "Tramo": st.column_config.TextColumn("Tramo"),
-        "Peso_pct": st.column_config.NumberColumn("Peso (%)", min_value=0.0, max_value=100.0, step=0.1),
-        "Es_Cash": st.column_config.CheckboxColumn("¿Cash/Money Market?"),
-        "TNA_Manual_pct": st.column_config.NumberColumn("TNA manual (% si es Cash)", step=0.5),
-        "Segmento_Manual": st.column_config.SelectboxColumn("Segmento (fallback)",
-                            options=["Sovereign", "Corporate", "Cash", "Otro"]),
-        "Clase_Manual": st.column_config.SelectboxColumn("Clase (fallback)",
-                         options=["CER", "Fija", "DL", "Dual", "HD", "Cash", "Otro"]),
-    },
-    key="portfolio_editor",
+base_port = st.session_state["portfolio"].copy()
+tna_caucion = st.number_input(
+    "Tasa de Caución / FCI Money Market — TNA (%)", min_value=0.0, max_value=200.0,
+    value=float(base_port.loc[base_port["Ticker"] == "CAUCION", "TNA_Manual_pct"].iloc[0]), step=0.5,
+    help="Único instrumento que no cotiza en Alphacast: la caución/FCI money market. El resto de la "
+         "tabla se busca automáticamente por Ticker en el dataset 41886.",
 )
-st.session_state["portfolio"] = edited.copy()
-port_df = edited.copy()
+base_port.loc[base_port["Ticker"] == "CAUCION", "TNA_Manual_pct"] = tna_caucion
+st.session_state["portfolio"] = base_port
+
+tabla_composicion = base_port[["Ticker", "Descripcion", "Objetivo", "Tramo", "Peso_pct"]].rename(
+    columns={"Peso_pct": "Peso (%)"})
+st.dataframe(tabla_composicion, use_container_width=True, hide_index=True, height=320)
+st.caption(f"Suma de pesos: **{base_port['Peso_pct'].sum():.1f}%** · Objetivo 2 (cobertura FX) = "
+           f"**{base_port.loc[base_port['Objetivo'].str.startswith('2'), 'Peso_pct'].sum():.1f}%** · "
+           f"Objetivo 1 (capital de trabajo) = "
+           f"**{base_port.loc[base_port['Objetivo'].str.startswith('1'), 'Peso_pct'].sum():.1f}%**")
+
+with st.expander("⚙️ Ajustes avanzados (opcional — solo si el IPS real cambió tickers o pesos)"):
+    st.caption("Esto NO hace falta para la clase. Se deja por si hay que corregir algo puntual sin "
+                "tocar el código: no se pueden agregar ni borrar instrumentos, solo editar valores.")
+    edited = st.data_editor(
+        base_port, num_rows="fixed", use_container_width=True, hide_index=True,
+        column_config={
+            "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
+            "Descripcion": st.column_config.TextColumn("Descripción", width="large"),
+            "Objetivo": st.column_config.SelectboxColumn("Objetivo",
+                         options=["1 · Capital de Trabajo", "2 · Cobertura FX Préstamo"]),
+            "Tramo": st.column_config.TextColumn("Tramo"),
+            "Peso_pct": st.column_config.NumberColumn("Peso (%)", min_value=0.0, max_value=100.0, step=0.05),
+            "Es_Cash": st.column_config.CheckboxColumn("¿Cash/Money Market?"),
+            "TNA_Manual_pct": st.column_config.NumberColumn("TNA manual (% si es Cash)", step=0.5),
+            "Segmento_Manual": st.column_config.SelectboxColumn("Segmento (fallback)",
+                                options=["Sovereign", "Corporate", "Cash", "Otro"]),
+            "Clase_Manual": st.column_config.SelectboxColumn("Clase (fallback)",
+                             options=["CER", "Fija", "DL", "Dual", "HD", "Cash", "Otro"]),
+        },
+        key="portfolio_editor",
+    )
+    st.session_state["portfolio"] = edited.copy()
+
+port_df = st.session_state["portfolio"].copy()
 port_df["Peso_pct"] = pd.to_numeric(port_df["Peso_pct"], errors="coerce").fillna(0.0)
 
 suma_pesos = port_df["Peso_pct"].sum()
-c_peso1, c_peso2 = st.columns([1, 3])
-c_peso1.metric("Suma de pesos", f"{suma_pesos:.1f}%")
 if abs(suma_pesos - 100.0) > 0.5:
-    c_peso2.warning(f"Los pesos suman {suma_pesos:.1f}%, no 100%. Ajustá la columna **Peso_pct** "
-                     f"antes de sacar conclusiones — las métricas de abajo se calculan sobre el peso "
-                     f"que sí está cargado.")
-else:
-    c_peso2.success("Los pesos de la cartera suman ~100%.")
+    st.warning(f"Los pesos suman {suma_pesos:.1f}%, no 100% — se modificó algo en 'Ajustes avanzados'. "
+               f"Las métricas de abajo se calculan sobre el peso que sí está cargado.")
 
 # ---------------------------------------------------------------------
 # Descarga de datos (real o sintética)
@@ -748,16 +796,17 @@ with tab_riesgo:
         st.info("No hay holdings marcados como Segmento = Corporate en la cartera actual.")
 
     st.divider()
-    st.markdown(f"**3) Sublímite Dollar-Linked en el tramo largo (referencia IPS: {sublimite_dl_tramo_largo:.0f}%):**")
-    tramo_largo = snap_hoy[snap_hoy["Tramo"].str.contains("Estructural|FX", case=False, na=False)]
-    if not tramo_largo.empty:
-        peso_tramo_largo = tramo_largo["Peso_pct"].sum()
-        peso_dl = tramo_largo.loc[tramo_largo["Clase"] == "DL", "Peso_pct"].sum()
-        pct_dl = (peso_dl / peso_tramo_largo * 100) if peso_tramo_largo > 0 else np.nan
-        st.metric("% Dollar-Linked dentro del tramo largo / cobertura FX", f"{pct_dl:.1f}%" if pd.notna(pct_dl) else "—",
-                  f"{pct_dl - sublimite_dl_tramo_largo:+.1f} pp vs. referencia" if pd.notna(pct_dl) else None)
+    st.markdown(f"**3) Sublímite Dollar-Linked sobre el total de la cartera (referencia IPS: {sublimite_dl_tramo_largo:.0f}%):**")
+    peso_total_cartera = snap_hoy["Peso_pct"].sum()
+    peso_dl = snap_hoy.loc[snap_hoy["Clase"] == "DL", "Peso_pct"].sum()
+    if peso_total_cartera > 0:
+        pct_dl = peso_dl / peso_total_cartera * 100
+        st.metric("% Dollar-Linked sobre el total de la cartera", f"{pct_dl:.1f}%",
+                  f"{pct_dl - sublimite_dl_tramo_largo:+.1f} pp vs. referencia")
+        st.caption("Todo instrumento clasificado DL (D31M7 y D30S6 por defecto) es la cobertura cambiaria "
+                    "del préstamo — por diseño del IPS, este ratio debería dar ≈86% de la cartera total.")
     else:
-        st.info("No hay holdings en el tramo Estructural / Cobertura FX para calcular este ratio.")
+        st.info("No hay holdings cargados para calcular este ratio.")
 
     st.divider()
     st.markdown("""
@@ -793,10 +842,12 @@ with tab_metodo:
     piso de referencia, no una predicción de mercado; sirve para contrastar contra los hitos de pago
     conocidos del préstamo (Mes 3 / 6 / 9).
 
-    **Cartera de partida:** reconstruida a partir del IPS del Grupo 8 (composición ≈ $175M, Objetivo 1
-    74% / Objetivo 2 26%, tramos 20% / 50% / 30% dentro de Objetivo 1). El ticker de cobertura FX de
-    Objetivo 2 y los pesos finos quedan **editables** — completalos con los datos reales antes de la
-    clase usando la tabla de la parte superior.
+    **Composición de la cartera:** son los 8 instrumentos exactos del IPS del Grupo 8, reconciliando
+    los dos gráficos de torta de la presentación (cartera consolidada $175M + detalle de Objetivo 1):
+    **D31M7** (79,1%) y **D30S6** (6,9%) — Dollar-Linked, cobertura FX del préstamo, 86,0% del total —
+    y dentro de Objetivo 1 (14,0% del total): **Cauciones** (1,4%), **S31L6** (1,4%), **TZXD6** (7,0%),
+    **TLCQO** (2,1%), **LOC5O** (1,05%) y **AO27** (1,05%). No hace falta agregar ni completar ningún
+    instrumento — el único dato manual es la TNA de la caución, porque no cotiza en Alphacast.
 
     **Cómo correr esto en Streamlit Cloud:**
     1. Subí `app.py` y `requirements.txt` a un repositorio de GitHub.
