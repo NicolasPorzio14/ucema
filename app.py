@@ -1434,6 +1434,91 @@ with tab_bench:
             c4.metric("Benchmark compuesto", f"{u['idx_total_bench'] - 100:+.1f}%" if pd.notna(u["idx_total_bench"]) else "—")
 
         st.divider()
+        with st.expander("🔎 Dataset de auditoría — precio de CADA activo vs. CADA benchmark (base 100)", expanded=True):
+            st.caption("Para entender por qué la cartera puede quedar debajo del benchmark: cada columna es "
+                       "un índice base 100 al día de la compra, en el tramo REALIZADO (≤ hoy). Los ACTIVOS "
+                       "usan su precio en pesos (Paridad × indexación FX/CER); los BENCHMARKS, su propia "
+                       "serie. Buscá qué instrumento crece MENOS que su índice de referencia — ese arrastra "
+                       "la cartera. Causa típica: un Dollar-Linked cuya Paridad cae (el bono se abarata) "
+                       "mientras el A3500 sube, con lo que rinde por debajo del A3500 puro aunque cubra.")
+
+            fechas_grid_audit = pd.DatetimeIndex(semanal["Date"])
+            audit = pd.DataFrame({"Date": fechas_grid_audit})
+            audit["Cartera"] = (100 * semanal["Valor_Cartera"] / semanal["Valor_Cartera"].iloc[0]).values
+
+            cols_activos = []
+            for tk in port_df.loc[~port_df["Es_Cash"], "Ticker"]:
+                serie = peso_price_series(df_norm, tk, fx_diario, cer_diario, fecha_compra, hasta_bm,
+                                          fecha_ancla=fecha_compra)
+                if serie.empty:
+                    audit[tk] = np.nan
+                    cols_activos.append(tk)
+                    continue
+                idx_union_a = pd.DatetimeIndex(sorted(set(serie.index) | set(fechas_grid_audit)))
+                serie_w = serie.reindex(idx_union_a).ffill().reindex(fechas_grid_audit)
+                base = serie_w.dropna().iloc[0] if serie_w.notna().any() else np.nan
+                audit[tk] = (100 * serie_w / base).values if pd.notna(base) else np.nan
+                cols_activos.append(tk)
+
+            # Caución (si está) base 100 desde su valor devengado por TNA
+            col_cau = "Valor_CAUCION"
+            if col_cau in semanal.columns and semanal[col_cau].notna().any():
+                base_cau = semanal[col_cau].dropna().iloc[0]
+                if base_cau and not pd.isna(base_cau):
+                    audit["CAUCION"] = (100 * semanal[col_cau] / base_cau).values
+                    cols_activos.append("CAUCION")
+
+            # Benchmarks (bench_tabla ya viene en base 100 sobre la MISMA grilla)
+            for col_src, col_dst in [("idx_A3500", "BM_A3500"), ("idx_CER", "BM_CER"),
+                                     ("idx_SHY_ars", "BM_SHY_ars"), ("idx_obj1_bench", "BM_Obj1"),
+                                     ("idx_obj2_bench", "BM_Obj2"), ("idx_total_bench", "BM_Total")]:
+                audit[col_dst] = bench_tabla[col_src].values if col_src in bench_tabla.columns else np.nan
+
+            # Solo tramo realizado: en la proyección los activos (Paridad real) se
+            # aplanan y los benchmarks (dato BCRA/Yahoo) también se aplanan por
+            # forward-fill — mezclarlo con la cartera proyectada por carry confunde.
+            # La underperformance que se quiere diagnosticar vive en lo realizado.
+            audit = audit[audit["Date"] <= as_of_hoy].reset_index(drop=True)
+
+            # Columna de ayuda: cuánto rinde la cartera vs. su benchmark total, punto a punto
+            if "BM_Total" in audit.columns and audit["BM_Total"].notna().any():
+                audit["Cartera_menos_BMTotal"] = audit["Cartera"] - audit["BM_Total"]
+
+            st.dataframe(audit.sort_values("Date"), use_container_width=True, height=340)
+
+            csv_audit = audit.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Descargar dataset de auditoría completo (CSV)", data=csv_audit,
+                                file_name=f"auditoria_cartera_vs_benchmark_{as_of_hoy.strftime('%Y%m%d')}.csv",
+                                mime="text/csv", key="dl_audit_full")
+
+            # Gráfico: cada activo (punteado) + la cartera (gruesa) + benchmark total
+            figA = go.Figure()
+            paleta = px.colors.qualitative.Set2 + px.colors.qualitative.Set1
+            for i, tk in enumerate(cols_activos):
+                if tk in audit.columns and audit[tk].notna().any():
+                    figA.add_trace(go.Scatter(x=audit["Date"], y=audit[tk], mode="lines", name=tk,
+                                              line=dict(width=1.3, color=paleta[i % len(paleta)], dash="dot")))
+            figA.add_trace(go.Scatter(x=audit["Date"], y=audit["Cartera"], mode="lines", name="CARTERA",
+                                      line=dict(width=3.2, color=COLORS["primary"])))
+            if "BM_Total" in audit.columns and audit["BM_Total"].notna().any():
+                figA.add_trace(go.Scatter(x=audit["Date"], y=audit["BM_Total"], mode="lines",
+                                          name="Benchmark total", line=dict(width=2.4, color=COLORS["ok"])))
+            if "BM_A3500" in audit.columns and audit["BM_A3500"].notna().any():
+                figA.add_trace(go.Scatter(x=audit["Date"], y=audit["BM_A3500"], mode="lines",
+                                          name="A3500", line=dict(width=1.8, color=COLORS["obj2"], dash="dash")))
+            figA.update_layout(title="Cada instrumento vs. la cartera y sus benchmarks (base 100, tramo realizado)",
+                               height=460, **PLOTLY_LAYOUT)
+            style_axes(figA, "Fecha", "Índice (base 100)")
+            st.plotly_chart(figA, use_container_width=True, key=f"audit_activos_{desde_bm}_{hasta_bm}")
+
+            st.caption("Cómo leerlo: si una línea de activo (punteada) queda por debajo del A3500 o del CER, "
+                       "ESE instrumento está rindiendo menos que la referencia y tira la cartera abajo. "
+                       "Recordá que el benchmark de Objetivo 1 pondera fuerte al CER (inflación), que suele "
+                       "correr más rápido que el crawl del A3500 — por eso un benchmark compuesto puede "
+                       "quedar por encima de una cartera 86% Dollar-Linked sin que haya ningún error de "
+                       "cálculo: es la diferencia real entre cubrirse al dólar vs. indexar a la inflación.")
+
+        st.divider()
         st.markdown("### 📊 Ratios de riesgo-retorno — Objetivo 1 (Capital de Trabajo)")
         st.caption("Sharpe, Sortino e Information Ratio tienen sentido económico en Objetivo 1 (busca "
                    "capturar tasa/carry). En Objetivo 2 y en la Cartera Total **no** se muestran estos "
@@ -1479,23 +1564,36 @@ with tab_bench:
 
         merged_ext = ext_ret.merge(bench_ext, on="Date", how="left")
 
-        # Sharpe/Sortino SIN restar tasa libre de riesgo (retorno/desvío puro):
-        # ahora los retornos son de precio en pesos y ya incorporan la indexación,
-        # pero restar una TNA nominal alta sigue distorsionando el excess return.
-        sh = sharpe_ratio(merged_ext["ret"], 0.0)
-        so = sortino_ratio(merged_ext["ret"], 0.0)
+        # Tasa libre de riesgo EN PESOS = TNA de la caución (money market), llevada
+        # a base semanal. Hay que RESTARLA ahora que los retornos son nominales en
+        # pesos e incorporan el drift de la indexación (FX/CER): con rf=0 el Sharpe
+        # se disparaba (3-4+) porque medía retorno/vol de una serie con drift casi
+        # constante y volatilidad semanal ínfima. Restar rf lo convierte en lo que
+        # debe ser: exceso de retorno POR ENCIMA del costo de mantener pesos.
+        tna_rf = float(port_df.loc[port_df["Es_Cash"], "TNA_Manual_pct"].dropna().iloc[0]) \
+            if port_df["Es_Cash"].any() and port_df.loc[port_df["Es_Cash"], "TNA_Manual_pct"].notna().any() else 0.0
+        rf_semanal = (1 + tna_rf / 100.0) ** (7 / 365.0) - 1
+
+        sh = sharpe_ratio(merged_ext["ret"], rf_semanal)
+        so = sortino_ratio(merged_ext["ret"], rf_semanal)
         ir = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
 
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Sharpe (sin tasa libre de riesgo)", f"{sh:.2f}" if pd.notna(sh) else "—")
-        r2.metric("Sortino (sin tasa libre de riesgo)", f"{so:.2f}" if pd.notna(so) else "—")
+        r1.metric(f"Sharpe (rf = TNA caución {tna_rf:.0f}%)", f"{sh:.2f}" if pd.notna(sh) else "—")
+        r2.metric(f"Sortino (rf = TNA caución {tna_rf:.0f}%)", f"{so:.2f}" if pd.notna(so) else "—")
         r3.metric("Information Ratio", f"{ir:.2f}" if pd.notna(ir) else "—")
         r4.metric("N° semanas usadas", f"{n_semanas_ext}")
-        st.caption("Sharpe = retorno medio semanal ÷ desvío semanal (anualizado ×√52) — **sin** restar la "
-                   "TNA de la caución. Sortino: igual, pero el desvío solo considera semanas con retorno "
-                   "negativo. Los retornos salen del precio en pesos ajustado por indexación (FX/CER), no "
-                   "de la Paridad. Benchmark del Information Ratio: el compuesto de Objetivo 1 (CER + SHY). "
-                   f"Ventana usada: {fecha_inicio_ext.strftime('%d/%m/%Y')} → {as_of_hoy.strftime('%d/%m/%Y')}.")
+        st.caption(f"Sharpe = (retorno medio semanal − rf semanal) ÷ desvío semanal, anualizado ×√52. La "
+                   f"tasa libre de riesgo es la TNA de la caución ({tna_rf:.0f}%) llevada a semanal "
+                   f"(rf_sem = {rf_semanal*100:.3f}%): se resta porque los retornos ya son nominales en "
+                   f"pesos e incluyen la indexación FX/CER — con rf=0 el número se inflaba artificialmente. "
+                   f"Sortino: igual, pero el desvío solo considera semanas por debajo de rf. Benchmark del "
+                   f"Information Ratio: el compuesto de Objetivo 1 (CER + SHY). "
+                   f"Ventana: {fecha_inicio_ext.strftime('%d/%m/%Y')} → {as_of_hoy.strftime('%d/%m/%Y')}.")
+        st.caption("⚠️ Aun corregido, tené presente que los instrumentos de devengamiento suave (CER, DL) "
+                   "tienden a mostrar un Sharpe alto porque su volatilidad semanal subestima el riesgo real "
+                   "(duration, crédito, liquidez, saltos de mercado que no se ven en la Paridad × índice). "
+                   "Un Sharpe > 2-3 acá es más un artefacto de suavidad que una señal de calidad excepcional.")
 
         st.divider()
         st.markdown("### 🛡️ Efectividad de Cobertura — Objetivo 2 y Cartera Total")
