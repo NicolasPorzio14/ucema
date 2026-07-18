@@ -15,18 +15,16 @@ Qué hace este panel:
                          cartera CADA LUNES (a nominales fijos) hasta fin de
                          año: tramo realizado con precio de mercado real, tramo
                          proyectado por devengamiento a la TIR vigente hoy.
-  3) RIESGO & LÍMITES  → chequeo automático de los límites del IPS: banda de
-                         duration, concentración máxima por emisor corporativo
-                         y sublímite Dollar-Linked sobre el total.
-  4) INSIGHTS          → performance vs. los benchmarks del propio IPS (TAMAR/
-                         CER, ETF SHY, A3500) y propuestas de mejora atadas a
-                         los 4 objetivos del mandato (preservación de capital,
-                         liquidez, protección inflación, cobertura cambiaria).
-  5) BRECHA CAMBIARIA  → dólar Oficial/Minorista/MEP/CCL y bandas de flotación,
+  3) BENCHMARKS & RATIOS → compara la cartera contra A3500 (dólar oficial),
+                         CER (inflación) y el ETF SHY (bonos del Tesoro de
+                         EE.UU. 1-3 años), y calcula Sharpe, Sortino e
+                         Information Ratio para la cartera total y para cada
+                         Objetivo (1 · Capital de Trabajo / 2 · Cobertura FX).
+  4) BRECHA CAMBIARIA  → dólar Oficial/Minorista/MEP/CCL y bandas de flotación,
                          con la brecha (MEP vs. Oficial) en el tiempo. Oficial/
                          Minorista/Bandas vienen de la API pública del BCRA (sin
                          API key); MEP/CCL de Alphacast.
-  6) METODOLOGÍA       → fuentes y supuestos.
+  5) METODOLOGÍA       → fuentes y supuestos.
 
 Fuente de mercado: Alphacast, dataset 41886 (ONs / Bonos / Soberanos — el mismo
 dataset del panel PRO de Renta Fija). Los instrumentos de money-market (caución,
@@ -74,11 +72,15 @@ BCRA_API_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/monetarias"
 BCRA_VARS = {"usd_oficial": 5, "usd_minorista": 4, "lower_band": 1187, "upper_band": 1188}
 REGIMEN_BANDAS_INICIO = "2025-04-14"  # primera fecha con dato de banda publicada por el BCRA
 
-# Benchmarks del propio IPS (diapositiva "Medición de Desempeño"), usados en
-# la pestaña de Insights — no se inventan, son los que define el mandato.
-BENCHMARK_TRAMO12_LO, BENCHMARK_TRAMO12_HI = 18.0, 22.0   # TAMAR / CER
-BENCHMARK_TRAMO3_LO, BENCHMARK_TRAMO3_HI = 3.6, 3.9        # ETF SHY (USD)
-BENCHMARK_A3500 = 20.0                                     # Devaluación esperada
+# --- Benchmarks (A3500 / CER / SHY) ---
+# A3500 y CER son series oficiales del BCRA (API pública, sin key): A3500 es la
+# misma variable "usd_oficial" ya definida arriba (idVariable 5); CER es el
+# "Coeficiente de Estabilización de Referencia" (idVariable 30). SHY (ETF de
+# bonos del Tesoro de EE.UU. de 1-3 años) no lo publica ningún organismo
+# argentino: sale de la API pública de cotizaciones de Yahoo Finance.
+BCRA_CER_ID = 30
+YAHOO_CHART_API = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+SHY_TICKER = "SHY"
 
 COLORS = {
     "primary": "#1f2a44",
@@ -405,7 +407,166 @@ def compute_brecha(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =====================================================================
-# Motor de cartera: snapshot ponderado y KPIs (para "Cartera Hoy" y "Riesgo")
+# Benchmarks (A3500 / CER / SHY) y ratios de riesgo-retorno
+# =====================================================================
+
+@st.cache_data(show_spinner=False, ttl=30 * 60)
+def fetch_shy_series(desde: str, hasta: str) -> pd.DataFrame:
+    """Precio diario ajustado del ETF SHY (bonos del Tesoro de EE.UU. 1-3 años),
+    API pública de Yahoo Finance (sin API key). Devuelve Date/Valor en USD."""
+    try:
+        start = pd.Timestamp(desde) - pd.Timedelta(days=6)
+        end = pd.Timestamp(hasta) + pd.Timedelta(days=2)
+        url = YAHOO_CHART_API.format(ticker=SHY_TICKER)
+        r = requests.get(url, params={"period1": int(start.timestamp()), "period2": int(end.timestamp()),
+                                       "interval": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        res = r.json()["chart"]["result"][0]
+        ts = res["timestamp"]
+        adj = res["indicators"].get("adjclose", [{}])[0].get("adjclose")
+        closes = adj if adj else res["indicators"]["quote"][0]["close"]
+        df = pd.DataFrame({"Date": pd.to_datetime(ts, unit="s").normalize(), "Valor": closes})
+        return df.dropna().sort_values("Date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["Date", "Valor"])
+
+
+@st.cache_data(show_spinner=False, ttl=30 * 60)
+def fetch_benchmark_bcra(desde: str, hasta: str) -> pd.DataFrame:
+    """A3500 (idVariable 5, mismo dato que usd_oficial) y CER (idVariable 30),
+    ambos de la API pública del BCRA."""
+    a3500 = fetch_bcra_variable(BCRA_VARS["usd_oficial"], desde, hasta).rename(columns={"Valor": "A3500"})
+    cer = fetch_bcra_variable(BCRA_CER_ID, desde, hasta).rename(columns={"Valor": "CER"})
+    return pd.merge(a3500, cer, on="Date", how="outer").sort_values("Date").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def synthetic_benchmark_series(desde: str, hasta: str, seed: int = 9) -> pd.DataFrame:
+    """A3500/CER/SHY sintéticos SOLO para el modo de ejemplo."""
+    rng = np.random.default_rng(seed)
+    fechas = pd.bdate_range(start=desde, end=hasta)
+    a3500 = 1450 + np.cumsum(rng.normal(0.6, 3.0, len(fechas)))
+    cer = 50.0 * np.cumprod(1 + rng.normal(0.0009, 0.0004, len(fechas)))
+    shy = 82.0 * np.cumprod(1 + rng.normal(0.00005, 0.0010, len(fechas)))
+    return pd.DataFrame({"Date": fechas, "A3500": a3500, "CER": cer, "SHY": shy})
+
+
+def _align_to_dates(df_diario: pd.DataFrame, fechas: pd.DatetimeIndex, cols: list) -> pd.DataFrame:
+    """Lleva una serie diaria a una grilla de fechas específica (ej. los lunes
+    de la simulación) tomando, para cada fecha, el último dato conocido en o
+    antes de esa fecha (forward-fill) — no inventa datos entre publicaciones."""
+    d = df_diario.set_index("Date").sort_index()
+    idx_union = pd.DatetimeIndex(sorted(set(list(d.index)) | set(fechas)))
+    d = d.reindex(idx_union).ffill()
+    return d.reindex(fechas)[cols].reset_index().rename(columns={"index": "Date"})
+
+
+def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
+                           df_bcra_bench: pd.DataFrame, df_shy: pd.DataFrame) -> tuple:
+    """Arma, sobre la MISMA grilla semanal de la simulación de cartera, los
+    retornos e índices (base 100) de A3500, CER, SHY-en-pesos y los benchmarks
+    compuestos de Objetivo 1 / Objetivo 2 / Cartera Total. Los pesos del blend
+    se toman de la cartera actual (dinámico, no hardcodeado), reproduciendo la
+    estructura de benchmarks de la diapositiva "Medición de Desempeño" del IPS:
+    Objetivo 1 = TAMAR/CER (Tramo 1/2) + ETF SHY (Tramo 3); Objetivo 2 = A3500."""
+    bench = df_bcra_bench.merge(df_shy.rename(columns={"Valor": "SHY"}), on="Date", how="outer").sort_values("Date")
+    aligned = _align_to_dates(bench, fechas, [c for c in ["A3500", "CER", "SHY"] if c in bench.columns])
+    for c in ["A3500", "CER", "SHY"]:
+        if c not in aligned.columns:
+            aligned[c] = np.nan
+
+    peso_obj1 = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Peso_pct"].sum()
+    peso_obj2 = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Peso_pct"].sum()
+    tramo12_tk = ["CAUCION", "S31L6", "TZXD6"]
+    tramo3_tk = ["TLCQO", "LOC5O", "AO27"]
+    peso_t12 = port_df.loc[port_df["Ticker"].isin(tramo12_tk), "Peso_pct"].sum()
+    peso_t3 = port_df.loc[port_df["Ticker"].isin(tramo3_tk), "Peso_pct"].sum()
+    w_cer = peso_t12 / peso_obj1 if peso_obj1 > 0 else 0.0
+    w_shy = peso_t3 / peso_obj1 if peso_obj1 > 0 else 0.0
+
+    out = aligned.copy()
+    out["ret_A3500"] = out["A3500"].pct_change()
+    out["ret_CER"] = out["CER"].pct_change()
+    out["ret_SHY_usd"] = out["SHY"].pct_change()
+    out["ret_SHY_ars"] = (1 + out["ret_SHY_usd"]) * (1 + out["ret_A3500"]) - 1
+    out["ret_obj1_bench"] = w_cer * out["ret_CER"] + w_shy * out["ret_SHY_ars"]
+    out["ret_obj2_bench"] = out["ret_A3500"]
+    out["ret_total_bench"] = (peso_obj1 / 100.0) * out["ret_obj1_bench"] + (peso_obj2 / 100.0) * out["ret_obj2_bench"]
+
+    for nombre, retcol in [("A3500", "ret_A3500"), ("CER", "ret_CER"), ("SHY_ars", "ret_SHY_ars"),
+                           ("obj1_bench", "ret_obj1_bench"), ("obj2_bench", "ret_obj2_bench"),
+                           ("total_bench", "ret_total_bench")]:
+        idx = (1 + out[retcol].fillna(0)).cumprod() * 100
+        if len(idx):
+            idx.iloc[0] = 100.0
+        out[f"idx_{nombre}"] = idx
+
+    pesos = dict(peso_obj1=peso_obj1, peso_obj2=peso_obj2, w_cer_in_obj1=w_cer, w_shy_in_obj1=w_shy)
+    return out, pesos
+
+
+def objetivo_returns_from_semanal(semanal: pd.DataFrame, port_df: pd.DataFrame) -> pd.DataFrame:
+    """Reconstruye el valor y el retorno semanal de Objetivo 1 y Objetivo 2 por
+    separado, sumando las columnas Valor_<ticker> que ya calculó la simulación
+    semanal — no hace falta volver a simular nada."""
+    obj1_tk = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Ticker"].tolist()
+    obj2_tk = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Ticker"].tolist()
+    cols_obj1 = [f"Valor_{t}" for t in obj1_tk if f"Valor_{t}" in semanal.columns]
+    cols_obj2 = [f"Valor_{t}" for t in obj2_tk if f"Valor_{t}" in semanal.columns]
+
+    out = semanal[["Date", "Estado"]].copy()
+    out["Valor_Obj1"] = semanal[cols_obj1].sum(axis=1) if cols_obj1 else np.nan
+    out["Valor_Obj2"] = semanal[cols_obj2].sum(axis=1) if cols_obj2 else np.nan
+    out["Valor_Total"] = semanal["Valor_Cartera"]
+    out["ret_Obj1"] = out["Valor_Obj1"].pct_change()
+    out["ret_Obj2"] = out["Valor_Obj2"].pct_change()
+    out["ret_Total"] = out["Valor_Total"].pct_change()
+    return out
+
+
+def sharpe_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
+    """Sharpe anualizado sobre retornos periódicos (semanales por defecto)."""
+    r = returns.dropna()
+    if len(r) < 2:
+        return np.nan
+    excess = r - rf_periodo
+    sd = excess.std(ddof=1)
+    if pd.isna(sd) or sd < 1e-10:
+        return np.nan
+    return float(excess.mean() / sd * np.sqrt(periods_per_year))
+
+
+def sortino_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
+    """Sortino anualizado: igual que Sharpe pero solo penaliza la volatilidad
+    a la baja (retornos por debajo de la tasa libre de riesgo)."""
+    r = returns.dropna()
+    if len(r) < 2:
+        return np.nan
+    excess = r - rf_periodo
+    downside = excess[excess < 0]
+    if len(downside) < 2:
+        return np.nan
+    dd = downside.std(ddof=1)
+    if pd.isna(dd) or dd < 1e-10:
+        return np.nan
+    return float(excess.mean() / dd * np.sqrt(periods_per_year))
+
+
+def information_ratio(returns: pd.Series, benchmark: pd.Series, periods_per_year: int = 52) -> float:
+    """Information Ratio anualizado: retorno activo (cartera − benchmark)
+    sobre el tracking error (desvío del retorno activo)."""
+    df = pd.concat([returns, benchmark], axis=1).dropna()
+    if len(df) < 2:
+        return np.nan
+    active = df.iloc[:, 0] - df.iloc[:, 1]
+    sd = active.std(ddof=1)
+    if pd.isna(sd) or sd < 1e-10:
+        return np.nan
+    return float(active.mean() / sd * np.sqrt(periods_per_year))
+
+
+# =====================================================================
+# Motor de cartera: snapshot ponderado y KPIs (para "Cartera Hoy")
 # =====================================================================
 
 def build_holdings_snapshot(port_df: pd.DataFrame, df_norm: pd.DataFrame,
@@ -463,14 +624,6 @@ def portfolio_kpis(snap: pd.DataFrame) -> dict:
     md_cartera = validos["Contrib_MD"].sum() / peso_valido if peso_valido > 0 else np.nan
     return dict(tir_cartera=tir_cartera, md_cartera=md_cartera,
                 peso_cubierto=peso_valido * 100, peso_total=snap["Peso_frac"].sum() * 100)
-
-
-def tir_ponderada(snap: pd.DataFrame, tickers: list) -> float:
-    """TIR ponderada de un subconjunto de tickers (para comparar contra los
-    benchmarks del IPS por tramo)."""
-    d = snap[snap["Ticker"].isin(tickers)].dropna(subset=["TIR"])
-    peso = d["Peso_pct"].sum()
-    return float((d["TIR"] * d["Peso_pct"]).sum() / peso) if peso > 0 else np.nan
 
 
 # =====================================================================
@@ -671,12 +824,6 @@ with st.sidebar:
     st.subheader("🗓️ Cronograma del préstamo")
     fecha_desembolso = st.date_input("Fecha de desembolso del préstamo", value=datetime(2026, 4, 1))
 
-    st.divider()
-    st.subheader("📐 Límites del IPS (editables)")
-    md_target_lo, md_target_hi = st.slider("Banda objetivo de Duration (años)", 0.0, 2.0, (0.50, 0.80), 0.01)
-    limite_emisor_corp = st.number_input("Límite máx. por ON corporativa individual (%)", value=3.15, step=0.05)
-    sublimite_dl = st.number_input("Sublímite Dollar-Linked sobre el total (%)", value=86.0, step=1.0)
-
 # ---------------------------------------------------------------------
 # Cartera — composición fija (según el IPS), con un único input real
 # ---------------------------------------------------------------------
@@ -769,7 +916,7 @@ else:
 
 if not data_ok:
     st.warning("⚠️ Sin datos de mercado del dataset principal (ONs/Bonos/Soberanos): las pestañas "
-               "'Cartera Hoy', 'Simulación Semanal', 'Riesgo' e 'Insights' quedan sin contenido hasta "
+               "'Cartera Hoy', 'Simulación Semanal' y 'Benchmarks & Ratios' quedan sin contenido hasta "
                "que cargues la Alphacast API Key o actives el modo de ejemplo. La pestaña "
                "'Brecha Cambiaria' funciona igual, porque usa la API pública del BCRA.")
     as_of_hoy = pd.Timestamp(datetime.now().date())
@@ -793,9 +940,9 @@ else:
     valor_actual_hoy = float(fila_hoy["Valor_Cartera"].iloc[0]) if not fila_hoy.empty else np.nan
     resultado_pct_hoy = float(fila_hoy["Rendimiento_Acumulado_%"].iloc[0]) if not fila_hoy.empty else np.nan
 
-tab_hoy, tab_sim, tab_riesgo, tab_insights, tab_brecha, tab_metodo = st.tabs(
-    ["🏠 Cartera Hoy", "📊 Simulación Semanal", "⚖️ Riesgo & Límites IPS",
-     "💡 Insights & Propuestas", "💵 Brecha Cambiaria", "ℹ️ Metodología"]
+tab_hoy, tab_sim, tab_bench, tab_brecha, tab_metodo = st.tabs(
+    ["🏠 Cartera Hoy", "📊 Simulación Semanal", "📐 Benchmarks & Ratios",
+     "💵 Brecha Cambiaria", "ℹ️ Metodología"]
 )
 
 # ---------------------------------------------------------------------
@@ -832,7 +979,7 @@ with tab_hoy:
                                outsidetextfont=dict(color="white", size=12))
             fig.update_layout(title="Por Objetivo", showlegend=False, height=380, **PLOTLY_LAYOUT)
             fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="pie_objetivo")
 
         with p2:
             g = snap_hoy.groupby("Tramo")["Peso_pct"].sum().reset_index()
@@ -843,7 +990,7 @@ with tab_hoy:
                                outsidetextfont=dict(color="white", size=12))
             fig.update_layout(title="Por Tramo", showlegend=False, height=380, **PLOTLY_LAYOUT)
             fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="pie_tramo")
 
         with p3:
             g = snap_hoy.groupby("Ticker")["Peso_pct"].sum().reset_index()
@@ -854,7 +1001,7 @@ with tab_hoy:
                                outsidetextfont=dict(color="white", size=12))
             fig.update_layout(title="Por Instrumento", showlegend=False, height=380, **PLOTLY_LAYOUT)
             fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="pie_instrumento")
 
         st.divider()
         st.subheader("Detalle de holdings — compra vs. hoy")
@@ -931,7 +1078,7 @@ with tab_sim:
                            height=440, **PLOTLY_LAYOUT)
         style_axes(fig, "Fecha", "Valor de la cartera (ARS)")
         watermark(fig, as_of_hoy, "Alphacast" if not modo_demo else "Ejemplo")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"sim_valor_{fecha_compra}_{fecha_fin_sim}")
 
         fig2 = px.bar(semanal.iloc[1:], x="Date", y="Rendimiento_Semanal_%",
                       color=semanal.iloc[1:]["Rendimiento_Semanal_%"] >= 0,
@@ -939,7 +1086,7 @@ with tab_sim:
         fig2.add_vline(x=as_of_hoy, line_dash="dash", line_color=COLORS["accent"])
         fig2.update_layout(title="Rendimiento semanal de la cartera (%)", height=340, **PLOTLY_LAYOUT, showlegend=False)
         style_axes(fig2, "Fecha", "Rendimiento semanal (%)")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True, key=f"sim_rend_{fecha_compra}_{fecha_fin_sim}")
 
         st.subheader("Tabla semanal completa")
         tabla_sem = semanal[["Date", "Estado", "Valor_Cartera", "Peso_Cubierto_pct",
@@ -956,141 +1103,110 @@ with tab_sim:
                             file_name=f"simulacion_semanal_grupo8_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
 
     # ---------------------------------------------------------------------
-    # TAB 3 — Riesgo & Límites IPS
+    # TAB 3 — Benchmarks & Ratios
     # ---------------------------------------------------------------------
-with tab_riesgo:
+with tab_bench:
     if not data_ok:
         st.info("Cargá datos de mercado (Alphacast real o modo de ejemplo) para ver esta pestaña.")
     else:
-        st.markdown("### ⚖️ Chequeo de límites del IPS")
+        st.markdown("### 📐 Comparación con Benchmarks")
+        st.caption("A3500 y CER: API pública del BCRA (sin API key). SHY (ETF de bonos del Tesoro de "
+                   "EE.UU. 1-3 años, convertido a pesos vía A3500): API pública de Yahoo Finance. Todo "
+                   "en base 100 al día de la compra.")
 
-        md_ok = pd.notna(kpis_hoy["md_cartera"]) and md_target_lo <= kpis_hoy["md_cartera"] <= md_target_hi
-        st.markdown(f"""
-        **1) Duration dentro de la banda objetivo ({md_target_lo:.2f} – {md_target_hi:.2f} años):**
-        {"✅ Cumple" if md_ok else "🔴 Fuera de banda"} — actual **{kpis_hoy['md_cartera']:.2f} años**
-        """ if pd.notna(kpis_hoy["md_cartera"]) else "**1) Duration:** sin datos suficientes.")
+        desde_bm = fecha_compra
+        hasta_bm = pd.Timestamp(semanal["Date"].max())
 
-        st.divider()
-        st.markdown(f"**2) Concentración máxima por ON corporativa individual (límite {limite_emisor_corp:.2f}%):**")
-        corp = snap_hoy[snap_hoy["Segmento"] == "Corporate"].copy()
-        if not corp.empty:
-            corp["Cumple"] = corp["Peso_pct"] <= limite_emisor_corp
-            corp_show = corp[["Ticker", "Descripcion", "Peso_pct", "Cumple"]].sort_values("Peso_pct", ascending=False)
-            st.dataframe(corp_show, use_container_width=True, height=160)
-            incumplen = corp_show.loc[~corp_show["Cumple"], "Ticker"].tolist()
-            if incumplen:
-                st.error(f"🔴 Exceden el límite individual: **{', '.join(incumplen)}**. Rebalancear o "
-                          f"diversificar en más emisores.")
-            else:
-                st.success("✅ Ninguna ON corporativa individual excede el límite.")
+        if modo_demo:
+            df_bench_raw = synthetic_benchmark_series(desde_bm.strftime("%Y-%m-%d"), hasta_bm.strftime("%Y-%m-%d"))
+            df_shy = df_bench_raw[["Date", "SHY"]].rename(columns={"SHY": "Valor"})
+            df_bench_bcra = df_bench_raw[["Date", "A3500", "CER"]]
         else:
-            st.info("No hay holdings marcados como Segmento = Corporate en la cartera actual.")
+            df_bench_bcra = fetch_benchmark_bcra(desde_bm.strftime("%Y-%m-%d"), hasta_bm.strftime("%Y-%m-%d"))
+            df_shy = fetch_shy_series(desde_bm.strftime("%Y-%m-%d"), hasta_bm.strftime("%Y-%m-%d"))
+            if df_shy.empty:
+                st.warning("No se pudo descargar SHY de Yahoo Finance (puede ser un bloqueo temporal del "
+                           "servicio). El benchmark de Objetivo 1 / Tramo 3 queda incompleto hasta reintentar.")
+
+        fechas_grid = pd.DatetimeIndex(semanal["Date"])
+        bench_tabla, pesos_bench = build_benchmark_table(port_df, fechas_grid, df_bench_bcra, df_shy)
+        obj_rets = objetivo_returns_from_semanal(semanal, port_df)
+
+        cartera_idx = 100 * semanal["Valor_Cartera"] / semanal["Valor_Cartera"].iloc[0]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=semanal["Date"], y=cartera_idx, mode="lines", name="Cartera",
+                                  line=dict(width=2.8, color=COLORS["primary"])))
+        fig.add_trace(go.Scatter(x=bench_tabla["Date"], y=bench_tabla["idx_A3500"], mode="lines", name="A3500",
+                                  line=dict(width=1.8, color=COLORS["obj2"], dash="dash")))
+        fig.add_trace(go.Scatter(x=bench_tabla["Date"], y=bench_tabla["idx_CER"], mode="lines", name="CER",
+                                  line=dict(width=1.8, color=COLORS["cer"], dash="dash")))
+        fig.add_trace(go.Scatter(x=bench_tabla["Date"], y=bench_tabla["idx_SHY_ars"], mode="lines",
+                                  name="SHY (en pesos)", line=dict(width=1.8, color=COLORS["accent"], dash="dot")))
+        fig.add_vline(x=as_of_hoy, line_dash="dash", line_color="#94a3b8", annotation_text="Hoy")
+        fig.update_layout(title="Cartera vs. Benchmarks (índice base 100 desde la compra)",
+                           height=440, **PLOTLY_LAYOUT)
+        style_axes(fig, "Fecha", "Índice (base 100)")
+        watermark(fig, hasta_bm, "BCRA + Yahoo Finance" if not modo_demo else "Ejemplo")
+        st.plotly_chart(fig, use_container_width=True, key=f"bench_idx_{desde_bm}_{hasta_bm}")
+
+        st.caption(f"Benchmark compuesto — Objetivo 1: {pesos_bench['w_cer_in_obj1']*100:.0f}% CER + "
+                   f"{pesos_bench['w_shy_in_obj1']*100:.0f}% SHY(en pesos) · Objetivo 2: 100% A3500 · "
+                   f"Total: {pesos_bench['peso_obj1']:.1f}% × benchmark Obj.1 + {pesos_bench['peso_obj2']:.1f}% "
+                   f"× benchmark Obj.2 (misma estructura que 'Medición de Desempeño' del IPS).")
+
+        ultimos = bench_tabla.dropna(subset=["idx_A3500"])
+        if not ultimos.empty:
+            u = ultimos.iloc[-1]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Cartera (acumulado)", f"{cartera_idx.iloc[-1] - 100:+.1f}%")
+            c2.metric("A3500 (acumulado)", f"{u['idx_A3500'] - 100:+.1f}%")
+            c3.metric("CER (acumulado)", f"{u['idx_CER'] - 100:+.1f}%" if pd.notna(u["idx_CER"]) else "—")
+            c4.metric("SHY en pesos (acumulado)", f"{u['idx_SHY_ars'] - 100:+.1f}%" if pd.notna(u["idx_SHY_ars"]) else "—")
 
         st.divider()
-        st.markdown(f"**3) Sublímite Dollar-Linked sobre el total de la cartera (referencia IPS: {sublimite_dl:.0f}%):**")
-        peso_total_cartera = snap_hoy["Peso_pct"].sum()
-        peso_dl = snap_hoy.loc[snap_hoy["Clase"] == "DL", "Peso_pct"].sum()
-        if peso_total_cartera > 0:
-            pct_dl = peso_dl / peso_total_cartera * 100
-            st.metric("% Dollar-Linked sobre el total de la cartera", f"{pct_dl:.1f}%",
-                      f"{pct_dl - sublimite_dl:+.1f} pp vs. referencia")
-            st.caption("Todo instrumento clasificado DL (D31M7 y D30S6 por defecto) es la cobertura cambiaria "
-                        "del préstamo — por diseño del IPS, este ratio debería dar ≈86% de la cartera total.")
-        else:
-            st.info("No hay holdings cargados para calcular este ratio.")
+        st.markdown("### 📊 Ratios de riesgo-retorno")
+        st.caption("Sharpe, Sortino e Information Ratio, anualizados (×√52), calculados sobre los "
+                   "rendimientos SEMANALES ya REALIZADOS (se excluyen las semanas proyectadas). Tasa "
+                   "libre de riesgo: TNA de la caución/money market.")
 
-        st.divider()
-        st.markdown("""
-        **4) Otros lineamientos del IPS (chequeo cualitativo):**
-        - ✅ Cero exposición a renta variable, cripto o derivados especulativos (por construcción de esta cartera de renta fija).
-        - ✅ Sin compra de dólar oficial/MEP — la cobertura FX se instrumenta vía instrumentos Dollar-Linked.
-        - 🔁 Rebalanceo mensual recomendado por desvío de tramo y liquidez mínima del Tramo Operativo.
-        """)
+        realizado = obj_rets[obj_rets["Estado"] != "Proyectado"]
+        n_semanas = int(realizado["ret_Total"].notna().sum())
+        if n_semanas < 8:
+            st.warning(f"⚠️ Solo hay **{n_semanas} semana(s)** de datos realizados desde la compra. Con una "
+                       f"muestra tan chica, Sharpe/Sortino/Information Ratio son poco confiables "
+                       f"estadísticamente — quedan acá como referencia metodológica, y se vuelven más "
+                       f"representativos a medida que se acumule historia real.")
 
-    # ---------------------------------------------------------------------
-    # TAB 4 — Insights & Propuestas de Mejora
-    # ---------------------------------------------------------------------
-with tab_insights:
-    if not data_ok:
-        st.info("Cargá datos de mercado (Alphacast real o modo de ejemplo) para ver esta pestaña.")
-    else:
-        st.markdown("### 💡 Performance vs. benchmarks del IPS")
-        st.caption("Los benchmarks son los que define el propio IPS (diapositiva 'Medición de Desempeño'): "
-                   "no se inventan referencias externas.")
+        merged = realizado.merge(bench_tabla, on="Date", how="left")
+        tna_rf = float(port_df.loc[port_df["Es_Cash"], "TNA_Manual_pct"].iloc[0]) if port_df["Es_Cash"].any() else 0.0
+        rf_semanal = (1 + tna_rf / 100.0) ** (7 / 365.0) - 1
 
-        tramo12_tickers = ["CAUCION", "S31L6", "TZXD6"]
-        tramo3_tickers = ["TLCQO", "LOC5O", "AO27"]
-        obj2_tickers = ["D31M7", "D30S6"]
-
-        tir_t12 = tir_ponderada(snap_hoy, tramo12_tickers)
-        tir_t3 = tir_ponderada(snap_hoy, tramo3_tickers)
-        tir_obj2 = tir_ponderada(snap_hoy, obj2_tickers)
-
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            ok12 = pd.notna(tir_t12) and BENCHMARK_TRAMO12_LO <= tir_t12 <= BENCHMARK_TRAMO12_HI
-            st.metric("Capital de Trabajo (Tramo 1/2) — TAMAR/CER 18-22%",
-                      f"{tir_t12:.1f}%" if pd.notna(tir_t12) else "—",
-                      "✅ dentro de banda" if ok12 else "⚠️ fuera de banda")
-        with b2:
-            ok3 = pd.notna(tir_t3) and BENCHMARK_TRAMO3_LO <= tir_t3 <= BENCHMARK_TRAMO3_HI
-            st.metric("Capital de Trabajo (Tramo 3) — ETF SHY ≈3,6-3,9%",
-                      f"{tir_t3:.1f}%" if pd.notna(tir_t3) else "—",
-                      "✅ dentro de banda" if ok3 else "⚠️ fuera de banda")
-        with b3:
-            st.metric("Cobertura FX (Objetivo 2) — A3500 ≈20% (devaluación)",
-                      f"{tir_obj2:.1f}% spread propio" if pd.notna(tir_obj2) else "—",
-                      "El retorno esperado en pesos ≈ devaluación (A3500) + este spread")
-
-        st.divider()
-        st.markdown("### 🎯 Estado por objetivo del mandato")
-
-        resultado_txt = f"{resultado_pct_hoy:+.2f}%" if pd.notna(resultado_pct_hoy) else "—"
-        cap_ok = pd.notna(resultado_pct_hoy) and resultado_pct_hoy >= 0
-        st.markdown(f"""
-    1. **Preservación de capital** (cero tolerancia a pérdida nominal): resultado acumulado desde la
-       compra = **{resultado_txt}**. {"✅ En línea con el mandato." if cap_ok else "⚠️ Resultado nominal negativo — revisar si es un movimiento transitorio de precio (bonos que pagan a la par al vencimiento) o una señal de rebalanceo."}
-    2. **Liquidez** (disponibilidad calzada a pagos): Tramo Operativo (Caución + S31L6) pesa
-       **{snap_hoy.loc[snap_hoy["Ticker"].isin(["CAUCION","S31L6"]), "Peso_pct"].sum():.1f}%** de la cartera.
-    3. **Protección inflación**: el tramo CER (TZXD6) pesa **{snap_hoy.loc[snap_hoy["Ticker"]=="TZXD6","Peso_pct"].sum():.1f}%**
-       de la cartera — es la única cobertura directa contra IPC; el resto de Objetivo 1 (Cauciones/S31L6/Tramo 3) está
-       en tasa nominal o dólares, no indexado a inflación.
-    4. **Cobertura cambiaria** (sin comprar dólar oficial): Dollar-Linked = **{pct_dl:.1f}%** de la cartera vs.
-       préstamo de $150M / cartera de {fmt_ars(monto_compra)} ≈ {150e6/monto_compra*100:.1f}% necesario — {"✅ calce adecuado." if abs(pct_dl - 150e6/monto_compra*100) < 5 else "⚠️ revisar calce."}
-        """)
-
-        st.divider()
-        st.markdown("### 📌 Propuestas de mejora")
-        bullets = []
-
-        if not cap_ok:
-            bullets.append("**Preservación de capital:** el resultado nominal acumulado es negativo. Si el driver es "
-                            "la Paridad de D31M7/D30S6 (que pagan a la par al vencimiento), no requiere acción — pero "
-                            "conviene documentarlo para el comité, porque el IPS declara *cero tolerancia* a pérdida nominal.")
-        if pd.notna(kpis_hoy["md_cartera"]) and not md_ok:
-            bullets.append(f"**Duration fuera de banda** ({kpis_hoy['md_cartera']:.2f} años vs. "
-                            f"{md_target_lo:.2f}-{md_target_hi:.2f}): rebalancear entre Tramo 2 (TZXD6) y Tramo 3 "
-                            f"para volver a la banda objetivo.")
-        if pd.notna(tir_t12) and not ok12:
-            direccion = "por debajo" if tir_t12 < BENCHMARK_TRAMO12_LO else "por encima"
-            bullets.append(f"**Tramo 1/2 rinde {direccion} del benchmark TAMAR/CER** ({tir_t12:.1f}% vs. 18-22%): "
-                            f"evaluar rotar Cauciones/S31L6/TZXD6 hacia instrumentos con mejor tasa dentro del mismo "
-                            f"horizonte (≤12 meses), sin resignar liquidez del Tramo Operativo.")
-        if pd.notna(tir_t3) and not ok3:
-            bullets.append(f"**Tramo 3 (Hard-Dollar) rinde distinto del benchmark SHY** ({tir_t3:.1f}% vs. 3,6-3,9%): "
-                            f"con solo 3 papeles y 4,2% del total, hay margen para sumar 1-2 ONs investment-grade "
-                            f"adicionales (sin superar el {limite_emisor_corp:.2f}% por emisor) y capturar mejor spread.")
-        bullets.append("**Calce de vencimientos:** D31M7 (~mar-2027) y D30S6 (~sep-2026) cubren el horizonte del "
-                        "préstamo, pero conviene escalonarlos exactamente contra los hitos de Mes 3/6/9 de desembolso "
-                        "de obra civil y maquinaria, para minimizar el riesgo de tener que vender un DL antes de "
-                        "vencimiento si el pago cae entre medio de dos vencimientos.")
-        bullets.append("**Diversificación del Tramo 3:** hoy son solo 3 instrumentos con pesos individuales muy chicos "
-                        "(1,05%-2,1%). Está lejos del límite de concentración (holgura), pero también lejos de "
-                        "aprovechar todo el presupuesto de riesgo permitido — se puede sumar diversificación sin "
-                        "tocar el perfil de riesgo agregado de la cartera.")
-
-        for b in bullets:
-            st.markdown(f"- {b}")
+        filas_ratio = []
+        for nombre, ret_col, bench_col in [
+            ("Cartera Total", "ret_Total", "ret_total_bench"),
+            ("Objetivo 1 · Capital de Trabajo", "ret_Obj1", "ret_obj1_bench"),
+            ("Objetivo 2 · Cobertura FX", "ret_Obj2", "ret_obj2_bench"),
+        ]:
+            r, b = merged[ret_col], merged[bench_col]
+            filas_ratio.append(dict(
+                Cartera=nombre,
+                Sharpe=sharpe_ratio(r, rf_semanal),
+                Sortino=sortino_ratio(r, rf_semanal),
+                Information_Ratio=information_ratio(r, b),
+                N_semanas=int(r.notna().sum()),
+            ))
+        tabla_ratios = pd.DataFrame(filas_ratio)
+        st.dataframe(tabla_ratios, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Sharpe": st.column_config.NumberColumn("Sharpe Ratio", format="%.2f"),
+                         "Sortino": st.column_config.NumberColumn("Sortino Ratio", format="%.2f"),
+                         "Information_Ratio": st.column_config.NumberColumn("Information Ratio", format="%.2f"),
+                         "N_semanas": st.column_config.NumberColumn("N° semanas", format="%d"),
+                     })
+        st.caption(f"Tasa libre de riesgo usada: TNA caución {tna_rf:.1f}% → {rf_semanal*100:.3f}% semanal. "
+                   "Information Ratio de cada Objetivo usa su propio benchmark compuesto (ver arriba); "
+                   "el de la Cartera Total usa el benchmark ponderado por el peso de cada Objetivo.")
 
     # ---------------------------------------------------------------------
     # TAB 5 — Brecha Cambiaria
@@ -1098,6 +1214,7 @@ with tab_insights:
 with tab_brecha:
     st.markdown("### 💵 Dólar y Brecha Cambiaria")
     st.caption("Oficial, minorista y bandas de flotación: API pública del BCRA (no requiere API key). "
+
                "MEP y CCL: dataset de Alphacast — mismo mecanismo de API key que el resto del panel.")
 
     cb1, cb2 = st.columns(2)
@@ -1184,7 +1301,7 @@ with tab_brecha:
                            height=440, **PLOTLY_LAYOUT)
         style_axes(fig, "Fecha", "$ por USD")
         watermark(fig, hasta_brecha, "BCRA + Alphacast" if not modo_demo else "Ejemplo")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"fx_dolar_{desde_brecha}_{hasta_brecha}")
 
         if df_fx["Brecha"].notna().any():
             fig2 = go.Figure()
@@ -1195,7 +1312,7 @@ with tab_brecha:
             fig2.update_layout(title="Brecha cambiaria — (MEP − Oficial) / Oficial", height=340,
                                **PLOTLY_LAYOUT, showlegend=False)
             style_axes(fig2, "Fecha", "Brecha (%)")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, use_container_width=True, key=f"fx_brecha_{desde_brecha}_{hasta_brecha}")
 
         st.subheader("Tabla completa")
         cols_fx = ["Date", "usd_mep", "usd_ccl", "usd_oficial", "usd_minorista", "upper_band", "lower_band", "Brecha"]
@@ -1229,9 +1346,19 @@ with tab_metodo:
     devengando la TIR vigente hoy de cada instrumento — es el piso esperado por carry, no una predicción
     de precios de mercado.
 
-    **Benchmarks (pestaña Insights):** son los del propio IPS, diapositiva "Medición de Desempeño":
-    TAMAR/CER 18%-22% para Tramo 1/2, ETF SHY ≈3,6-3,9% para Tramo 3, y A3500 ≈20% de devaluación
-    esperada para la cobertura cambiaria de Objetivo 2.
+    **Benchmarks (pestaña Benchmarks & Ratios):** A3500 y CER salen de la API pública del BCRA (idVariables
+    5 y 30). SHY (ETF de bonos del Tesoro de EE.UU. 1-3 años) sale de la API pública de Yahoo Finance, y se
+    convierte a pesos componiendo su retorno en USD con la devaluación de A3500. El benchmark de Objetivo 1
+    combina CER y SHY(en pesos) ponderados por el peso real de Tramo 1/2 y Tramo 3 dentro de Objetivo 1; el
+    de Objetivo 2 es 100% A3500; el de la Cartera Total pondera ambos por el peso de cada Objetivo — misma
+    estructura que la diapositiva "Medición de Desempeño" del IPS (TAMAR/CER para Tramo 1/2, ETF SHY para
+    Tramo 3, A3500 para la cobertura cambiaria).
+
+    **Ratios de riesgo-retorno:** Sharpe y Sortino usan como tasa libre de riesgo la TNA de la caución;
+    Sortino solo penaliza la volatilidad a la baja. El Information Ratio compara el retorno activo (cartera
+    − su benchmark compuesto) contra el tracking error. Los tres se anualizan multiplicando por √52 y se
+    calculan únicamente sobre semanas ya REALIZADAS (nunca sobre las proyectadas) — con pocas semanas de
+    historia real, son poco representativos y la app lo advierte explícitamente.
 
     **Brecha cambiaria:** Oficial (`Tipo de cambio mayorista de referencia`, idVariable 5), Minorista
     (idVariable 4) y las bandas de flotación (`Régimen de bandas cambiarias — Límite inferior/superior`,
