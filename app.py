@@ -35,6 +35,30 @@ gráficos de torta del IPS (cartera consolidada + detalle de Objetivo 1): no es
 una estimación ni requiere completar instrumentos. El único dato que no sale
 de Alphacast es la TNA de la caución/money market.
 
+================================================================================
+CORRECCIÓN FINANCIERA (sección Benchmark & valor de cartera)
+--------------------------------------------------------------------------------
+La `Paridad` de Alphacast = Precio de mercado ÷ Valor Técnico. El Valor Técnico
+de un bono indexado NO es 100 constante:
+  · Dollar-Linked (D31M7, D30S6): el VT se mueve 1:1 con el A3500.
+  · Hard-Dollar / soberano en USD (TLCQO, LOC5O, AO27): el VT está en dólares.
+  · CER (TZXD6): el VT se mueve con el CER.
+  · LECAP / sin indexar (S31L6): la Paridad ya ES el precio en pesos.
+
+Usar la Paridad sola como "precio en pesos" (como hacía la versión anterior)
+le RESTA toda la indexación a los instrumentos indexados: si el bono devenga la
+devaluación perfectamente, la Paridad se queda quieta y el retorno calculado da
+~0, aunque en pesos el bono valga muchísimo más. Por eso la cartera aparecía
+muy por debajo del A3500 y el Hedge Ratio salía artificialmente bajo.
+
+Fix: se reconstruye el PRECIO EN PESOS de cada instrumento indexado como
+`Paridad(t) × VT(t)/VT(ancla)`, donde VT(t)/VT(ancla) es el índice real
+(A3500 o CER) desde la fecha de ancla. No se necesita ni fecha de emisión ni
+el VT nominal real: solo importan retornos relativos, así que se ancla el VT a
+la fecha de compra (o al primer dato del papel) y se lo hace crecer con el
+índice. Todo el motor (simulación semanal, hedge ratio, ratios de riesgo) pasa
+a operar sobre este precio en pesos, NO sobre la Paridad cruda.
+
 Requisitos: streamlit, pandas, numpy, plotly, alphacast, openpyxl
 """
 
@@ -62,25 +86,28 @@ except Exception:
 DATASET_ID = 41886  # ONs / Bonos / Soberanos — mismo dataset que el panel PRO
 
 # --- Brecha cambiaria: fuentes de datos ---
-# MEP y CCL no son series oficiales del BCRA (surgen de operar bonos/acciones en
-# distintas plazas), así que salen de Alphacast. Oficial, minorista y las bandas
-# de flotación SÍ son series oficiales del BCRA, y su API pública (sin API key)
-# las expone directamente — se usa esa en lugar de Alphacast para esas cuatro,
-# porque es la fuente primaria y no consume cupo de la cuenta de Alphacast.
-FX_DATASET_ID = 5288  # Alphacast: "Markets - Argentina - FX premiums - Daily" (Blue/MEP/CCL/Oficial/Mayorista)
+FX_DATASET_ID = 5288  # Alphacast: "Markets - Argentina - FX premiums - Daily"
 BCRA_API_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/monetarias"
 BCRA_VARS = {"usd_oficial": 5, "usd_minorista": 4, "lower_band": 1187, "upper_band": 1188}
 REGIMEN_BANDAS_INICIO = "2025-04-14"  # primera fecha con dato de banda publicada por el BCRA
 
 # --- Benchmarks (A3500 / CER / SHY) ---
-# A3500 y CER son series oficiales del BCRA (API pública, sin key): A3500 es la
-# misma variable "usd_oficial" ya definida arriba (idVariable 5); CER es el
-# "Coeficiente de Estabilización de Referencia" (idVariable 30). SHY (ETF de
-# bonos del Tesoro de EE.UU. de 1-3 años) no lo publica ningún organismo
-# argentino: sale de la API pública de cotizaciones de Yahoo Finance.
 BCRA_CER_ID = 30
 YAHOO_CHART_API = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 SHY_TICKER = "SHY"
+
+# =====================================================================
+# Indexación real de cada instrumento — separa Paridad de precio en pesos
+# =====================================================================
+# "FX"  → el Valor Técnico se mueve 1:1 con el A3500 (Dollar-Linked, o USD).
+# "CER" → el Valor Técnico se mueve con el CER.
+# "ARS" → sin indexación: la Paridad ya es directamente el precio en pesos.
+IND_TICKER = {
+    "D31M7": "FX", "D30S6": "FX",                 # Dollar-Linked: VT indexado al FX oficial
+    "TLCQO": "FX", "LOC5O": "FX", "AO27": "FX",   # Hard-Dollar / soberano USD: VT en dólares
+    "TZXD6": "CER",                                # CER: VT indexado al CER
+    "S31L6": "ARS",                                # LECAP: sin indexación, la Paridad ya es precio
+}
 
 COLORS = {
     "primary": "#1f2a44",
@@ -129,9 +156,7 @@ def watermark(fig: go.Figure, fecha=None, fuente="Alphacast") -> go.Figure:
 
 
 def fmt_ars(x: float) -> str:
-    """Formatea un monto en pesos con separador de miles al estilo argentino
-    (punto), sin tocar el resto del texto — evita pisar comas gramaticales
-    cuando el número se inserta dentro de una oración."""
+    """Formatea un monto en pesos con separador de miles al estilo argentino."""
     if pd.isna(x):
         return "—"
     return f"${x:,.0f}".replace(",", ".")
@@ -155,9 +180,6 @@ COUPON_TO_CLASE = {
 # =====================================================================
 # Cartera por defecto — composición EXACTA del IPS (Grupo 8, comité julio 2026)
 # =====================================================================
-# Reconciliada a partir de los DOS gráficos de "Composición" del IPS (ver el
-# docstring de default_portfolio() para el detalle numérico). Los 8 tickers y
-# pesos son la cartera completa — no faltan instrumentos por cargar.
 
 def default_portfolio() -> pd.DataFrame:
     """Composición EXACTA de la cartera del Grupo 8, reconciliada a partir de los
@@ -171,9 +193,6 @@ def default_portfolio() -> pd.DataFrame:
     D31M7 y D30S6 (Dollar-Linked) son la cobertura cambiaria del préstamo:
     79,1% + 6,9% = 86,0% del total — coincide EXACTO con el "Sublímite 86%
     Dollar-Linked" de la diapositiva de riesgos, y con $150M/$175M ≈ 86%.
-    El resto (14,0%) es Objetivo 1, y sus pesos internos reconstruyen el 3,5%
-    que faltaba en el primer gráfico (S31L6 1,4% + LOC5O 1,05% + AO27 1,05%).
-    Las 8 filas de abajo son la cartera COMPLETA.
     """
     rows = [
         # ---- Objetivo 2 · Cobertura FX del préstamo (86,0% del total) ----
@@ -273,7 +292,12 @@ def snapshot_asof(df_norm: pd.DataFrame, tickers: list, as_of: pd.Timestamp) -> 
 @st.cache_data(show_spinner=False)
 def synthetic_dataset(tickers: list, seed: int = 8, days: int = 420) -> pd.DataFrame:
     """Genera una serie de tiempo plausible (random walk acotado) por ticker,
-    SOLO para poder recorrer la interfaz sin conexión a Alphacast."""
+    SOLO para poder recorrer la interfaz sin conexión a Alphacast.
+
+    NOTA: la Paridad sintética se mantiene cerca de 100 a propósito — así, tras
+    la corrección de indexación, un DL sintético muestra que su precio en pesos
+    sube casi 1:1 con el FX sintético (la cobertura "funciona"), tal como se
+    espera del dato real."""
     rng = np.random.default_rng(seed)
     hoy = pd.Timestamp(datetime.now().date())
     fechas = pd.bdate_range(end=hoy, periods=days)
@@ -311,8 +335,7 @@ def synthetic_dataset(tickers: list, seed: int = 8, days: int = 420) -> pd.DataF
 @st.cache_data(show_spinner=False, ttl=30 * 60)
 def fetch_bcra_variable(id_variable: int, desde: str, hasta: str) -> pd.DataFrame:
     """Serie diaria de una variable del BCRA (API pública v4.0, sin autenticación).
-    Devuelve columnas Date/Valor; DataFrame vacío si la API falla o no hay datos
-    (nunca inventa un valor — un error acá se ve como un hueco en el gráfico)."""
+    Devuelve columnas Date/Valor; DataFrame vacío si la API falla o no hay datos."""
     try:
         r = requests.get(f"{BCRA_API_BASE}/{id_variable}", params={"desde": desde, "hasta": hasta}, timeout=20)
         r.raise_for_status()
@@ -348,9 +371,7 @@ def fetch_bcra_fx_bundle(desde: str, hasta: str) -> tuple:
 
 def normalize_fx_dataset(df: pd.DataFrame) -> pd.DataFrame:
     """Normaliza el dataset de Alphacast de FX premiums para quedarse con MEP y
-    CCL. Los nombres de columna varían de dataset a dataset, así que se buscan
-    por palabra clave en vez de hardcodear un nombre exacto — si no encuentra
-    alguna, la deja en NaN y lo reporta (nunca inventa el dato)."""
+    CCL, buscando las columnas por palabra clave (los nombres varían)."""
     df = df.copy()
     date_col = next((c for c in df.columns if str(c).strip().lower() in ("date", "fecha")), df.columns[0])
     df = df.rename(columns={date_col: "Date"})
@@ -378,8 +399,7 @@ def normalize_fx_dataset(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def synthetic_fx_bundle(desde: str, hasta: str, seed: int = 8) -> pd.DataFrame:
     """Serie sintética de oficial/minorista/MEP/CCL/bandas SOLO para el modo de
-    ejemplo — reproduce el orden de magnitud y la lógica de bandas (piso -1%/mes,
-    techo +1%/mes desde $1000-$1400 el 14/4/2025) pero no es dato real."""
+    ejemplo — reproduce el orden de magnitud y la lógica de bandas."""
     rng = np.random.default_rng(seed)
     fechas = pd.bdate_range(start=desde, end=hasta)
     base = pd.Timestamp(REGIMEN_BANDAS_INICIO)
@@ -399,8 +419,7 @@ def synthetic_fx_bundle(desde: str, hasta: str, seed: int = 8) -> pd.DataFrame:
 
 
 def compute_brecha(df: pd.DataFrame) -> pd.DataFrame:
-    """Agrega la columna Brecha = (MEP - Oficial) / Oficial, idéntica a la
-    fórmula de la planilla original del usuario."""
+    """Agrega la columna Brecha = (MEP - Oficial) / Oficial."""
     d = df.copy()
     d["Brecha"] = (d["usd_mep"] - d["usd_oficial"]) / d["usd_oficial"]
     return d
@@ -412,8 +431,7 @@ def compute_brecha(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=30 * 60)
 def fetch_shy_series(desde: str, hasta: str) -> pd.DataFrame:
-    """Precio diario ajustado del ETF SHY (bonos del Tesoro de EE.UU. 1-3 años),
-    API pública de Yahoo Finance (sin API key). Devuelve Date/Valor en USD."""
+    """Precio diario ajustado del ETF SHY, API pública de Yahoo Finance."""
     try:
         start = pd.Timestamp(desde) - pd.Timedelta(days=6)
         end = pd.Timestamp(hasta) + pd.Timedelta(days=2)
@@ -433,8 +451,7 @@ def fetch_shy_series(desde: str, hasta: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=30 * 60)
 def fetch_benchmark_bcra(desde: str, hasta: str) -> pd.DataFrame:
-    """A3500 (idVariable 5, mismo dato que usd_oficial) y CER (idVariable 30),
-    ambos de la API pública del BCRA."""
+    """A3500 (idVariable 5) y CER (idVariable 30), ambos de la API pública del BCRA."""
     a3500 = fetch_bcra_variable(BCRA_VARS["usd_oficial"], desde, hasta).rename(columns={"Valor": "A3500"})
     cer = fetch_bcra_variable(BCRA_CER_ID, desde, hasta).rename(columns={"Valor": "CER"})
     return pd.merge(a3500, cer, on="Date", how="outer").sort_values("Date").reset_index(drop=True)
@@ -452,9 +469,8 @@ def synthetic_benchmark_series(desde: str, hasta: str, seed: int = 9) -> pd.Data
 
 
 def _align_to_dates(df_diario: pd.DataFrame, fechas: pd.DatetimeIndex, cols: list) -> pd.DataFrame:
-    """Lleva una serie diaria a una grilla de fechas específica (ej. los lunes
-    de la simulación) tomando, para cada fecha, el último dato conocido en o
-    antes de esa fecha (forward-fill) — no inventa datos entre publicaciones."""
+    """Lleva una serie diaria a una grilla de fechas específica tomando el último
+    dato conocido en o antes de cada fecha (forward-fill)."""
     d = df_diario.set_index("Date").sort_index()
     idx_union = pd.DatetimeIndex(sorted(set(list(d.index)) | set(fechas)))
     d = d.reindex(idx_union).ffill()
@@ -462,10 +478,7 @@ def _align_to_dates(df_diario: pd.DataFrame, fechas: pd.DatetimeIndex, cols: lis
 
 
 def primer_dato_disponible(df_norm: pd.DataFrame, tickers: list) -> dict:
-    """Primera fecha con Paridad no nula para cada ticker, en TODO el dataset
-    (sin recortar por ninguna ventana) — para diagnosticar si un ticker joven
-    (ej. un DL recién emitido) realmente no tiene más historia disponible, en
-    vez de asumir que 'pedir más semanas' siempre destraba más datos."""
+    """Primera fecha con Paridad no nula para cada ticker, en TODO el dataset."""
     out = {}
     for t in tickers:
         d = df_norm[(df_norm["Ticker"] == t) & df_norm["Paridad"].notna()]
@@ -473,37 +486,83 @@ def primer_dato_disponible(df_norm: pd.DataFrame, tickers: list) -> dict:
     return out
 
 
-def daily_price_series_ticker(df_norm: pd.DataFrame, ticker: str, fecha_inicio: pd.Timestamp,
-                               fecha_fin: pd.Timestamp) -> pd.Series:
-    """Serie de Paridad de un ticker en [fecha_inicio, fecha_fin], filtrando
-    ANTES que nada las fechas sin dato (None) — no las deja pasar a ningún
-    cálculo posterior. Ojo: esto es a propósito distinto de 'rellenar con el
-    último precio conocido' (ffill): un día sin cotización simplemente no
-    entra a la serie, en vez de fingir que el precio no se movió ese día."""
-    d = df_norm[(df_norm["Ticker"] == ticker) & (df_norm["Date"] >= fecha_inicio) &
-                (df_norm["Date"] <= fecha_fin)][["Date", "Paridad"]].dropna()
-    d = d.drop_duplicates(subset="Date").sort_values("Date")
-    if d.empty:
+# =====================================================================
+# *** NÚCLEO DE LA CORRECCIÓN ***
+# Reconstrucción del PRECIO EN PESOS de cada instrumento a partir de la
+# Paridad y de su indexación real (FX o CER). Todo lo demás cuelga de acá.
+# =====================================================================
+
+def _indice_diario(tipo: str, fx_diario: pd.Series, cer_diario: pd.Series) -> pd.Series:
+    """Devuelve la serie de índice de indexación que le corresponde al tipo de
+    instrumento: A3500 para FX, CER para CER, vacía para ARS/sin índice."""
+    if tipo == "FX" and fx_diario is not None:
+        return fx_diario.dropna()
+    if tipo == "CER" and cer_diario is not None:
+        return cer_diario.dropna()
+    return pd.Series(dtype=float)
+
+
+def peso_price_series(df_norm: pd.DataFrame, ticker: str, fx_diario: pd.Series, cer_diario: pd.Series,
+                       fecha_inicio: pd.Timestamp, fecha_fin: pd.Timestamp,
+                       fecha_ancla: pd.Timestamp = None) -> pd.Series:
+    """Precio EN PESOS reconstruido de 'ticker', ajustando la Paridad por la
+    indexación real del instrumento (FX o CER).
+
+    Precio_pesos(t) = Paridad(t) × [ Índice(t) / Índice(ancla) ]
+
+    donde Índice es el A3500 (para Dollar-Linked / USD) o el CER (para bonos
+    CER). Se ancla el Valor Técnico a 'fecha_ancla' (o al primer dato del propio
+    ticker si no se pasa): el nivel absoluto del VT es arbitrario porque solo
+    importan retornos relativos, pero el CRECIMIENTO del VT sí importa y es lo
+    que la Paridad sola no captura.
+
+    Para instrumentos 'ARS' (LECAP, sin indexación) devuelve la Paridad tal cual:
+    ahí la Paridad ya ES el precio en pesos."""
+    paridad = df_norm[(df_norm["Ticker"] == ticker) & (df_norm["Date"] >= fecha_inicio) &
+                       (df_norm["Date"] <= fecha_fin)][["Date", "Paridad"]].dropna()
+    paridad = paridad.drop_duplicates(subset="Date").sort_values("Date").set_index("Date")["Paridad"]
+    if paridad.empty:
+        return paridad
+
+    tipo = IND_TICKER.get(ticker, "ARS")
+    if tipo == "ARS":
+        return paridad
+
+    indice = _indice_diario(tipo, fx_diario, cer_diario)
+    if indice.empty:
+        # Sin serie de índice no se puede reconstruir el precio en pesos de un
+        # instrumento indexado. Se devuelve vacío (a propósito) en vez de la
+        # Paridad cruda: preferimos "sin dato" a un dato financieramente falso.
         return pd.Series(dtype=float)
-    return d.set_index("Date")["Paridad"]
+
+    ancla = pd.Timestamp(fecha_ancla) if fecha_ancla is not None else paridad.index.min()
+    idx_union = pd.DatetimeIndex(sorted(set(indice.index) | set(paridad.index) | {ancla}))
+    indice_ff = indice.reindex(idx_union).ffill()
+    if ancla not in indice_ff.index or pd.isna(indice_ff.loc[ancla]):
+        return pd.Series(dtype=float)
+
+    factor_vt = indice_ff / indice_ff.loc[ancla]           # VT(t)/VT(ancla)
+    return (paridad * factor_vt.reindex(paridad.index)).dropna()
 
 
 def price_index_multi(port_df: pd.DataFrame, df_norm: pd.DataFrame, tickers: list,
-                       fecha_inicio: pd.Timestamp, fecha_fin: pd.Timestamp) -> pd.Series:
-    """Índice de NIVEL de precio (Paridad, no retorno) ponderado por peso
-    relativo entre los tickers que tengan dato cada fecha — pensado para
-    comparar directo primer vs. último valor. Los días sin ningún dato ya
-    quedan filtrados (fuera de la serie), no se completan con nada."""
+                       fecha_inicio: pd.Timestamp, fecha_fin: pd.Timestamp,
+                       fx_diario: pd.Series = None, cer_diario: pd.Series = None,
+                       fecha_ancla: pd.Timestamp = None) -> pd.Series:
+    """Índice de NIVEL de PRECIO EN PESOS (ya ajustado por indexación, NO Paridad
+    cruda) ponderado por peso relativo entre los tickers que tengan dato cada
+    fecha. Los días sin ningún dato quedan fuera de la serie."""
     sub = port_df[port_df["Ticker"].isin(tickers)].copy()
     peso_total_sub = sub["Peso_pct"].sum()
     sub["Peso_norm"] = sub["Peso_pct"] / peso_total_sub if peso_total_sub > 0 else 0.0
 
-    hist = df_norm[df_norm["Ticker"].isin(tickers) & (df_norm["Date"] >= fecha_inicio) &
-                   (df_norm["Date"] <= fecha_fin)]
-    piv = hist.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first").sort_index()
-    for t in tickers:
-        if t not in piv.columns:
-            piv[t] = np.nan
+    series_por_ticker = {t: peso_price_series(df_norm, t, fx_diario, cer_diario,
+                                               fecha_inicio, fecha_fin, fecha_ancla) for t in tickers}
+    no_vacias = [s for s in series_por_ticker.values() if not s.empty]
+    if not no_vacias:
+        return pd.Series(dtype=float)
+    idx_union = pd.DatetimeIndex(sorted(set().union(*[set(s.index) for s in no_vacias])))
+    piv = pd.DataFrame({t: s.reindex(idx_union) for t, s in series_por_ticker.items()})
 
     w = sub.set_index("Ticker")["Peso_norm"].reindex(tickers).fillna(0.0)
     peso_disponible = piv[tickers].notna().astype(float).mul(w, axis=1).sum(axis=1)
@@ -513,18 +572,14 @@ def price_index_multi(port_df: pd.DataFrame, df_norm: pd.DataFrame, tickers: lis
 
 
 def hedge_ratio_directo(precio_activo: pd.Series, precio_bench: pd.Series) -> dict:
-    """Hedge Ratio 'directo' — el mismo cálculo que se haría a mano en Excel:
-    (último precio ÷ primer precio − 1) del activo, dividido por lo mismo del
-    benchmark, usando el primer y el último dato VÁLIDO de cada serie.
+    """Hedge Ratio 'directo' (dollar-offset): (último ÷ primer precio − 1) del
+    activo, sobre lo mismo del benchmark (A3500), usando primer y último dato
+    VÁLIDO de cada serie.
 
-    Por qué no encadenar retornos diarios (pct_change + producto): si el
-    activo tiene un hueco de cotización de varios días, pct_change() pierde
-    TODO el movimiento de precio que hubo durante ese hueco (la fila
-    siguiente al hueco queda NaN, porque le falta el dato previo para
-    compararse) — y como el benchmark (A3500) sí cotiza todos los días, ese
-    tramo de movimiento se computa distinto para cada lado y el ratio queda
-    sesgado. Comparando directo primer vs. último precio ese problema no
-    existe: importa cuánto se movió cada uno en total, no día por día."""
+    IMPORTANTE: ahora 'precio_activo' es el PRECIO EN PESOS ajustado por FX
+    (no la Paridad). Por eso el Hedge Ratio ya mide la cobertura REAL: cuánto
+    subió el instrumento en pesos vs. cuánto se devaluó el peso. ~100% = calzó
+    1:1 con la devaluación; >100% = rindió por encima (spread propio del DL)."""
     a = precio_activo.dropna().sort_index()
     if len(a) < 2:
         return dict(n=len(a), hedge_ratio=np.nan, corr=np.nan, desde=None, hasta=None)
@@ -539,10 +594,6 @@ def hedge_ratio_directo(precio_activo: pd.Series, precio_bench: pd.Series) -> di
     ret_bench = b_ventana.iloc[-1] / b_ventana.iloc[0] - 1
     hr = (ret_activo / ret_bench * 100) if abs(ret_bench) > 1e-6 else np.nan
 
-    # La correlación sí es período a período — pero alineando el benchmark a
-    # las MISMAS fechas donde el activo tiene dato (no a un calendario
-    # completo), para no comparar un tramo de varios días del activo contra
-    # un solo día del benchmark.
     ret_activo_serie = a.pct_change()
     b_alineado = b.reindex(a.index).pct_change()
     common = pd.concat([ret_activo_serie, b_alineado], axis=1).dropna()
@@ -553,12 +604,11 @@ def hedge_ratio_directo(precio_activo: pd.Series, precio_bench: pd.Series) -> di
 
 def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
                            df_bcra_bench: pd.DataFrame, df_shy: pd.DataFrame) -> tuple:
-    """Arma, sobre la MISMA grilla semanal de la simulación de cartera, los
-    retornos e índices (base 100) de A3500, CER, SHY-en-pesos y los benchmarks
-    compuestos de Objetivo 1 / Objetivo 2 / Cartera Total. Los pesos del blend
-    se toman de la cartera actual (dinámico, no hardcodeado), reproduciendo la
-    estructura de benchmarks de la diapositiva "Medición de Desempeño" del IPS:
-    Objetivo 1 = TAMAR/CER (Tramo 1/2) + ETF SHY (Tramo 3); Objetivo 2 = A3500."""
+    """Arma, sobre la MISMA grilla semanal de la simulación, los retornos e
+    índices (base 100) de A3500, CER, SHY-en-pesos y los benchmarks compuestos
+    de Objetivo 1 / Objetivo 2 / Cartera Total. Reproduce la estructura de la
+    diapositiva "Medición de Desempeño" del IPS:
+    Objetivo 1 = CER (Tramo 1/2) + ETF SHY (Tramo 3); Objetivo 2 = A3500."""
     bench = df_bcra_bench.merge(df_shy.rename(columns={"Valor": "SHY"}), on="Date", how="outer").sort_values("Date")
     aligned = _align_to_dates(bench, fechas, [c for c in ["A3500", "CER", "SHY"] if c in bench.columns])
     for c in ["A3500", "CER", "SHY"]:
@@ -595,10 +645,104 @@ def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
     return out, pesos
 
 
+def sharpe_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
+    """Sharpe anualizado sobre retornos periódicos (semanales por defecto)."""
+    r = returns.dropna()
+    if len(r) < 2:
+        return np.nan
+    excess = r - rf_periodo
+    sd = excess.std(ddof=1)
+    if pd.isna(sd) or sd < 1e-10:
+        return np.nan
+    return float(excess.mean() / sd * np.sqrt(periods_per_year))
+
+
+def sortino_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
+    """Sortino anualizado: solo penaliza la volatilidad a la baja."""
+    r = returns.dropna()
+    if len(r) < 2:
+        return np.nan
+    excess = r - rf_periodo
+    downside = excess[excess < 0]
+    if len(downside) < 2:
+        return np.nan
+    dd = downside.std(ddof=1)
+    if pd.isna(dd) or dd < 1e-10:
+        return np.nan
+    return float(excess.mean() / dd * np.sqrt(periods_per_year))
+
+
+def information_ratio(returns: pd.Series, benchmark: pd.Series, periods_per_year: int = 52) -> float:
+    """Information Ratio anualizado: retorno activo sobre el tracking error."""
+    df = pd.concat([returns, benchmark], axis=1).dropna()
+    if len(df) < 2:
+        return np.nan
+    active = df.iloc[:, 0] - df.iloc[:, 1]
+    sd = active.std(ddof=1)
+    if pd.isna(sd) or sd < 1e-10:
+        return np.nan
+    return float(active.mean() / sd * np.sqrt(periods_per_year))
+
+
+def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, tickers: list,
+                             fecha_fin: pd.Timestamp, semanas: int,
+                             fx_diario: pd.Series = None, cer_diario: pd.Series = None) -> tuple:
+    """Serie semanal de retornos PONDERADOS POR PESO de un subconjunto de la
+    cartera, extendida 'semanas' hacia atrás desde 'fecha_fin'. Existe SOLO para
+    darle tamaño de muestra a los ratios de riesgo y al Hedge Ratio.
+
+    *** Ahora los retornos salen del PRECIO EN PESOS ajustado por indexación
+    (peso_price_series), no de la Paridad cruda. *** Cada semana pondera solo
+    entre los tickers con dato ese día (re-normalizando por el peso disponible).
+    Devuelve (df[Date, ret], tickers_sin_dato, fecha_inicio_real)."""
+    fecha_fin = pd.Timestamp(fecha_fin)
+    fecha_inicio = fecha_fin - pd.Timedelta(weeks=int(semanas))
+    fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, freq="W-MON")
+    if fecha_fin not in fechas:
+        fechas = fechas.append(pd.DatetimeIndex([fecha_fin]))
+    fechas = pd.DatetimeIndex(sorted(fechas.unique()))
+
+    sub = port_df[port_df["Ticker"].isin(tickers)].copy()
+    peso_total_sub = sub["Peso_pct"].sum()
+    sub["Peso_norm"] = sub["Peso_pct"] / peso_total_sub if peso_total_sub > 0 else 0.0
+    bonos = sub.loc[~sub["Es_Cash"], "Ticker"].tolist()
+
+    precios_semanales, faltan = {}, []
+    for t in bonos:
+        serie = peso_price_series(df_norm, t, fx_diario, cer_diario, fecha_inicio, fecha_fin)
+        if serie.empty:
+            faltan.append(t)
+            precios_semanales[t] = pd.Series(index=fechas, dtype=float)
+            continue
+        idx_union = pd.DatetimeIndex(sorted(set(serie.index) | set(fechas)))
+        precios_semanales[t] = serie.reindex(idx_union).ffill().reindex(fechas)
+
+    piv_precio = pd.DataFrame(precios_semanales)
+    if piv_precio.empty:
+        piv_precio = pd.DataFrame(index=fechas)
+    ret_bonos = piv_precio.pct_change()
+    w_bonos = sub.set_index("Ticker")["Peso_norm"].reindex(bonos).fillna(0.0)
+    peso_disponible = ret_bonos.notna().astype(float).mul(w_bonos, axis=1).sum(axis=1)
+    contrib_bonos = ret_bonos.fillna(0.0).mul(w_bonos, axis=1).sum(axis=1)
+
+    cash_rows = sub[sub["Es_Cash"]]
+    w_cash = float(cash_rows["Peso_norm"].sum()) if not cash_rows.empty else 0.0
+    tna = float(cash_rows["TNA_Manual_pct"].iloc[0]) if not cash_rows.empty else 0.0
+    ret_cash_semanal = (1 + tna / 100.0) ** (7 / 365.0) - 1
+
+    peso_total_disponible = peso_disponible + w_cash
+    ret_total = (contrib_bonos + w_cash * ret_cash_semanal) / peso_total_disponible.replace(0, np.nan)
+    if len(ret_total):
+        ret_total.iloc[0] = np.nan  # la primera fecha no tiene período previo
+
+    out = pd.DataFrame({"Date": fechas, "ret": ret_total.reindex(fechas).values,
+                         "peso_cubierto_pct": (peso_total_disponible.reindex(fechas) * 100).values})
+    return out, faltan, fecha_inicio
+
+
 def objetivo_returns_from_semanal(semanal: pd.DataFrame, port_df: pd.DataFrame) -> pd.DataFrame:
-    """Reconstruye el valor y el retorno semanal de Objetivo 1 y Objetivo 2 por
-    separado, sumando las columnas Valor_<ticker> que ya calculó la simulación
-    semanal — no hace falta volver a simular nada."""
+    """Reconstruye valor y retorno semanal de Objetivo 1 y 2 sumando las columnas
+    Valor_<ticker> ya calculadas por la simulación semanal."""
     obj1_tk = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Ticker"].tolist()
     obj2_tk = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Ticker"].tolist()
     cols_obj1 = [f"Valor_{t}" for t in obj1_tk if f"Valor_{t}" in semanal.columns]
@@ -614,107 +758,14 @@ def objetivo_returns_from_semanal(semanal: pd.DataFrame, port_df: pd.DataFrame) 
     return out
 
 
-def sharpe_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
-    """Sharpe anualizado sobre retornos periódicos (semanales por defecto)."""
-    r = returns.dropna()
-    if len(r) < 2:
-        return np.nan
-    excess = r - rf_periodo
-    sd = excess.std(ddof=1)
-    if pd.isna(sd) or sd < 1e-10:
-        return np.nan
-    return float(excess.mean() / sd * np.sqrt(periods_per_year))
-
-
-def sortino_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
-    """Sortino anualizado: igual que Sharpe pero solo penaliza la volatilidad
-    a la baja (retornos por debajo de la tasa libre de riesgo)."""
-    r = returns.dropna()
-    if len(r) < 2:
-        return np.nan
-    excess = r - rf_periodo
-    downside = excess[excess < 0]
-    if len(downside) < 2:
-        return np.nan
-    dd = downside.std(ddof=1)
-    if pd.isna(dd) or dd < 1e-10:
-        return np.nan
-    return float(excess.mean() / dd * np.sqrt(periods_per_year))
-
-
-def information_ratio(returns: pd.Series, benchmark: pd.Series, periods_per_year: int = 52) -> float:
-    """Information Ratio anualizado: retorno activo (cartera − benchmark)
-    sobre el tracking error (desvío del retorno activo)."""
-    df = pd.concat([returns, benchmark], axis=1).dropna()
-    if len(df) < 2:
-        return np.nan
-    active = df.iloc[:, 0] - df.iloc[:, 1]
-    sd = active.std(ddof=1)
-    if pd.isna(sd) or sd < 1e-10:
-        return np.nan
-    return float(active.mean() / sd * np.sqrt(periods_per_year))
-
-
-def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, tickers: list,
-                             fecha_fin: pd.Timestamp, semanas: int) -> tuple:
-    """Serie semanal de retornos PONDERADOS POR PESO (no por VN comprado) de un
-    subconjunto de la cartera (ej. Objetivo 1), extendida 'semanas' semanas
-    hacia atrás desde 'fecha_fin'. Existe SOLO para darle más tamaño de
-    muestra al cálculo de Sharpe/Sortino/Information Ratio — no es la
-    simulación de tenencia real (esa vive en 'semanal', a nominales fijos
-    desde la compra). Cada semana pondera solo entre los tickers que
-    efectivamente tienen dato ese día (re-normalizando por el peso
-    disponible), en vez de asumir retorno cero en los que falten.
-    Devuelve (df[Date, ret], tickers_sin_ningun_dato, fecha_inicio_real)."""
-    fecha_fin = pd.Timestamp(fecha_fin)
-    fecha_inicio = fecha_fin - pd.Timedelta(weeks=int(semanas))
-    fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, freq="W-MON")
-    if fecha_fin not in fechas:
-        fechas = fechas.append(pd.DatetimeIndex([fecha_fin]))
-    fechas = pd.DatetimeIndex(sorted(fechas.unique()))
-
-    sub = port_df[port_df["Ticker"].isin(tickers)].copy()
-    peso_total_sub = sub["Peso_pct"].sum()
-    sub["Peso_norm"] = sub["Peso_pct"] / peso_total_sub if peso_total_sub > 0 else 0.0
-
-    bonos = sub.loc[~sub["Es_Cash"], "Ticker"].tolist()
-    hist = df_norm[df_norm["Ticker"].isin(bonos)]
-    piv_par = hist.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first").sort_index()
-    idx_union = pd.DatetimeIndex(sorted(set(list(piv_par.index)) | set(fechas)))
-    piv_par = piv_par.reindex(idx_union).ffill().reindex(fechas)
-    for t in bonos:
-        if t not in piv_par.columns:
-            piv_par[t] = np.nan
-    faltan = [t for t in bonos if piv_par[t].isna().all()]
-
-    ret_bonos = piv_par[bonos].pct_change()
-    w_bonos = sub.set_index("Ticker")["Peso_norm"].reindex(bonos).fillna(0.0)
-    peso_disponible = ret_bonos.notna().astype(float).mul(w_bonos, axis=1).sum(axis=1)
-    contrib_bonos = ret_bonos.fillna(0.0).mul(w_bonos, axis=1).sum(axis=1)
-
-    cash_rows = sub[sub["Es_Cash"]]
-    w_cash = float(cash_rows["Peso_norm"].sum()) if not cash_rows.empty else 0.0
-    tna = float(cash_rows["TNA_Manual_pct"].iloc[0]) if not cash_rows.empty else 0.0
-    ret_cash_semanal = (1 + tna / 100.0) ** (7 / 365.0) - 1
-
-    peso_total_disponible = peso_disponible + w_cash
-    ret_total = (contrib_bonos + w_cash * ret_cash_semanal) / peso_total_disponible.replace(0, np.nan)
-    ret_total.iloc[0] = np.nan  # la primera fecha de la serie no tiene retorno (no hay período previo)
-
-    out = pd.DataFrame({"Date": fechas, "ret": ret_total.values,
-                         "peso_cubierto_pct": (peso_total_disponible * 100).values})
-    return out, faltan, fecha_inicio
-
-
 # =====================================================================
 # Motor de cartera: snapshot ponderado y KPIs (para "Cartera Hoy")
 # =====================================================================
 
 def build_holdings_snapshot(port_df: pd.DataFrame, df_norm: pd.DataFrame,
                              as_of: pd.Timestamp) -> pd.DataFrame:
-    """Combina la cartera (pesos) con el dato de mercado más reciente disponible
-    a la fecha 'as_of'. Para filas Es_Cash usa la TNA manual (MD=0). Para
-    tickers que no aparecen en el dataset, deja TIR/MD en NaN y lo marca."""
+    """Combina la cartera (pesos) con el dato de mercado más reciente a 'as_of'.
+    Para filas Es_Cash usa la TNA manual (MD=0)."""
     port = port_df.copy()
     bond_tickers = port.loc[~port["Es_Cash"], "Ticker"].tolist()
     mkt = snapshot_asof(df_norm, bond_tickers, as_of) if bond_tickers else pd.DataFrame()
@@ -773,11 +824,13 @@ def portfolio_kpis(snap: pd.DataFrame) -> dict:
 
 def compute_compra(port_df: pd.DataFrame, df_norm: pd.DataFrame, fecha_compra: pd.Timestamp,
                     monto_total: float) -> pd.DataFrame:
-    """Simula la compra de TODA la cartera en 'fecha_compra' con 'monto_total'
-    de capital, repartido según Peso_pct. El VN comprado de cada bono surge de
-    dividir el monto asignado por su Paridad (precio) en esa fecha exacta. Para
-    Cash, el 'VN' es directamente el monto (no hay concepto de paridad — crece
-    por TNA, no por precio)."""
+    """Simula la compra de TODA la cartera en 'fecha_compra' con 'monto_total',
+    repartido según Peso_pct. El VN comprado de cada bono = monto asignado ÷
+    Paridad (precio) en esa fecha. Para Cash, el 'VN' es directamente el monto.
+
+    Ojo: acá se usa la Paridad de la fecha de compra como precio inicial — es
+    correcto, porque el factor de indexación VT(t)/VT(compra) vale 1 en t=compra.
+    La indexación entra recién a partir de la compra, en simulacion_semanal."""
     port = port_df.copy()
     fecha_compra = pd.Timestamp(fecha_compra)
     bond_tickers = port.loc[~port["Es_Cash"], "Ticker"].tolist()
@@ -811,13 +864,21 @@ def compute_compra(port_df: pd.DataFrame, df_norm: pd.DataFrame, fecha_compra: p
 
 
 def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_compra: pd.Timestamp,
-                        as_of_hoy: pd.Timestamp, fecha_fin: pd.Timestamp) -> pd.DataFrame:
+                        as_of_hoy: pd.Timestamp, fecha_fin: pd.Timestamp,
+                        fx_diario: pd.Series = None, cer_diario: pd.Series = None) -> pd.DataFrame:
     """Valor de la cartera CADA LUNES desde 'fecha_compra' hasta 'fecha_fin', a
-    NOMINALES FIJOS (los comprados en fecha_compra — sin rebalanceo). Las fechas
-    <= as_of_hoy usan precio real de mercado (Paridad, con forward-fill para
-    instrumentos ilíquidos); las posteriores se proyectan por devengamiento a
-    la TIR vigente en as_of_hoy (constante desde ahí — no es una predicción de
-    mercado, es el piso esperado por carry)."""
+    NOMINALES FIJOS (sin rebalanceo).
+
+    *** CORRECCIÓN: el precio en pesos de cada bono es Paridad(t) × factor de
+    indexación VT(t)/VT(compra). *** Para un Dollar-Linked, el factor incorpora
+    la devaluación REAL del A3500 desde la compra — que es justo lo que la
+    Paridad sola se pierde. Así el valor en pesos de la cartera sube con el FX
+    y queda comparable contra el A3500 (antes quedaba planchado y muy por
+    debajo del benchmark).
+
+    · Fechas <= as_of_hoy: Paridad real de mercado × factor de indexación real.
+    · Fechas > as_of_hoy (proyección): se devenga la TIR vigente hoy, SIN asumir
+      devaluación futura — es el piso por carry, no un pronóstico de FX."""
     fecha_compra = pd.Timestamp(fecha_compra)
     as_of_hoy = pd.Timestamp(as_of_hoy)
     fecha_fin = pd.Timestamp(fecha_fin)
@@ -834,6 +895,22 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
     idx_union = pd.DatetimeIndex(sorted(set(list(piv_par.index) + fechas + [as_of_hoy])))
     piv_par = piv_par.reindex(idx_union).ffill()
     piv_tir = piv_tir.reindex(idx_union).ffill()
+
+    # Factor VT(t)/VT(compra) por indexación real, anclado en la fecha de compra:
+    # en t=compra el factor es 1 (no toca compute_compra), y desde ahí incorpora
+    # la devaluación/CER REAL — lo que la Paridad sola no captura.
+    factor_idx = {}
+    for tk in bonos:
+        tipo = IND_TICKER.get(tk, "ARS")
+        indice = _indice_diario(tipo, fx_diario, cer_diario)
+        if tipo == "ARS" or indice.empty:
+            factor_idx[tk] = pd.Series(1.0, index=idx_union)
+            continue
+        ind_ff = indice.reindex(pd.DatetimeIndex(sorted(set(indice.index) | set(idx_union)))).ffill().reindex(idx_union)
+        if fecha_compra not in ind_ff.index or pd.isna(ind_ff.loc[fecha_compra]):
+            factor_idx[tk] = pd.Series(1.0, index=idx_union)
+        else:
+            factor_idx[tk] = ind_ff / ind_ff.loc[fecha_compra]
 
     filas = []
     for f in fechas:
@@ -855,11 +932,16 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
                 tk = r["Ticker"]
                 if tk not in piv_par.columns:
                     continue
+                fvt_serie = factor_idx.get(tk, pd.Series(1.0, index=idx_union))
                 if f <= as_of_hoy and f in piv_par.index:
-                    p = piv_par.loc[f, tk]
+                    p_paridad = piv_par.loc[f, tk]
+                    fvt = fvt_serie.get(f, 1.0)
+                    p = p_paridad * fvt if pd.notna(p_paridad) else np.nan
                 else:
-                    p_hoy = piv_par.loc[as_of_hoy, tk] if as_of_hoy in piv_par.index else np.nan
+                    p_hoy_paridad = piv_par.loc[as_of_hoy, tk] if as_of_hoy in piv_par.index else np.nan
                     tir_hoy = piv_tir.loc[as_of_hoy, tk] if as_of_hoy in piv_tir.index else np.nan
+                    fvt_hoy = fvt_serie.get(as_of_hoy, 1.0)
+                    p_hoy = p_hoy_paridad * fvt_hoy if pd.notna(p_hoy_paridad) else np.nan
                     if pd.notna(p_hoy) and pd.notna(tir_hoy):
                         dias_proy = (f - as_of_hoy).days
                         p = p_hoy * (1 + tir_hoy / 100.0) ** (dias_proy / 365.0)
@@ -886,9 +968,7 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
 
 def build_excel_snapshot(tabla_hoy: pd.DataFrame, kpis: dict, port_compra: pd.DataFrame = None,
                           semanal: pd.DataFrame = None) -> bytes:
-    """Informe simple en Excel (foto del momento): resumen de KPIs, tabla de
-    holdings, detalle de la compra del 29/6 y la simulación semanal. Sin
-    fórmulas ni gráficos nativos — es un respaldo de datos, no un modelo vivo."""
+    """Informe simple en Excel (foto del momento)."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         resumen = pd.DataFrame({
@@ -1055,6 +1135,14 @@ else:
         except Exception as e:
             st.error(f"No se pudo descargar/procesar el dataset: {e}")
 
+# ---------------------------------------------------------------------
+# Series de indexación (A3500 / CER) — necesarias para reconstruir el precio
+# en pesos de los instrumentos indexados. Se descargan UNA vez y se pasan a
+# la simulación semanal y a toda la sección de benchmark/hedge.
+# ---------------------------------------------------------------------
+fx_diario = None
+cer_diario = None
+
 if not data_ok:
     st.warning("⚠️ Sin datos de mercado del dataset principal (ONs/Bonos/Soberanos): las pestañas "
                "'Cartera Hoy', 'Simulación Semanal' y 'Benchmarks & Ratios' quedan sin contenido hasta "
@@ -1067,17 +1155,34 @@ if not data_ok:
     semanal = pd.DataFrame()
     valor_actual_hoy = np.nan
     resultado_pct_hoy = np.nan
+    hoy_row = None
 else:
     as_of_hoy = pd.Timestamp(fecha_datos)
+
+    # Serie de indexación diaria (A3500 y CER) desde la compra hasta el fin de
+    # la simulación. Es la que "alimenta" el factor VT(t)/VT(compra).
+    _rango_desde = min(fecha_compra, as_of_hoy)
+    _rango_hasta = max(as_of_hoy, fecha_fin_sim)
+    if modo_demo:
+        _bf = synthetic_benchmark_series(_rango_desde.strftime("%Y-%m-%d"), _rango_hasta.strftime("%Y-%m-%d"))
+    else:
+        _bf = fetch_benchmark_bcra(_rango_desde.strftime("%Y-%m-%d"), _rango_hasta.strftime("%Y-%m-%d"))
+    if not _bf.empty and "A3500" in _bf.columns:
+        fx_diario = _bf.dropna(subset=["A3500"]).set_index("Date")["A3500"]
+    if not _bf.empty and "CER" in _bf.columns:
+        cer_diario = _bf.dropna(subset=["CER"]).set_index("Date")["CER"]
+
     snap_hoy = build_holdings_snapshot(port_df, df_norm, as_of_hoy)
     kpis_hoy = portfolio_kpis(snap_hoy)
 
-    # Compra del 29/6 y simulación semanal — se calculan UNA vez y se reusan en
-    # todas las pestañas (única fuente de verdad).
+    # Compra del 29/6 y simulación semanal — se calculan UNA vez (con las series
+    # de indexación) y se reusan en todas las pestañas.
     port_compra = compute_compra(port_df, df_norm, fecha_compra, monto_compra)
-    semanal = simulacion_semanal(port_compra, df_norm, fecha_compra, as_of_hoy, fecha_fin_sim)
+    semanal = simulacion_semanal(port_compra, df_norm, fecha_compra, as_of_hoy, fecha_fin_sim,
+                                  fx_diario=fx_diario, cer_diario=cer_diario)
 
     fila_hoy = semanal[semanal["Estado"] == "Hoy"]
+    hoy_row = fila_hoy.iloc[0] if not fila_hoy.empty else None
     valor_actual_hoy = float(fila_hoy["Valor_Cartera"].iloc[0]) if not fila_hoy.empty else np.nan
     resultado_pct_hoy = float(fila_hoy["Rendimiento_Acumulado_%"].iloc[0]) if not fila_hoy.empty else np.nan
 
@@ -1105,7 +1210,8 @@ with tab_hoy:
         k4.metric("Valor actual (hoy)", fmt_ars(valor_actual_hoy),
                   f"{resultado_pct_hoy:+.2f}% desde la compra" if pd.notna(resultado_pct_hoy) else None)
         st.caption(f"Snapshot al {as_of_hoy.strftime('%d/%m/%Y')}" + (" (datos de ejemplo)" if modo_demo else "") +
-                   f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')}")
+                   f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')} · El 'Valor actual' incorpora la "
+                   f"indexación real (FX/CER) de los instrumentos, no solo la Paridad.")
 
         st.divider()
         p1, p2, p3 = st.columns(3)
@@ -1146,13 +1252,26 @@ with tab_hoy:
 
         st.divider()
         st.subheader("Detalle de holdings — compra vs. hoy")
+        st.caption("El 'Valor actual' de cada bono se toma de la simulación semanal (fila 'Hoy'), que ya "
+                   "aplica la indexación real FX/CER — es la MISMA fuente de verdad que el KPI de arriba, "
+                   "no un cálculo aparte basado en Paridad cruda.")
+
         detalle = snap_hoy.merge(
             port_compra[["Ticker", "Monto_Invertido", "Precio_Compra", "VN_Comprado"]], on="Ticker", how="left")
-        detalle["Valor_Actual"] = np.where(
-            detalle["Es_Cash"],
-            detalle["Monto_Invertido"] * (1 + detalle["TNA_Manual_pct"] / 100.0) ** ((as_of_hoy - fecha_compra).days / 365.0),
-            detalle["VN_Comprado"] * detalle["Paridad"] / 100.0,
-        )
+
+        # Valor actual = el que ya calculó la simulación semanal para la fila 'Hoy'
+        # (indexación real incluida). Para el Cash, si por algún motivo no está en
+        # la fila 'Hoy', se cae al devengamiento por TNA.
+        def _valor_actual_hoy(row):
+            col = f"Valor_{row['Ticker']}"
+            if hoy_row is not None and col in hoy_row.index and pd.notna(hoy_row[col]):
+                return float(hoy_row[col])
+            if row["Es_Cash"] and pd.notna(row.get("Monto_Invertido")):
+                dias = (as_of_hoy - fecha_compra).days
+                return row["Monto_Invertido"] * (1 + row["TNA_Manual_pct"] / 100.0) ** (dias / 365.0)
+            return np.nan
+
+        detalle["Valor_Actual"] = detalle.apply(_valor_actual_hoy, axis=1)
         detalle["Resultado_%"] = (detalle["Valor_Actual"] / detalle["Monto_Invertido"] - 1) * 100
         cols_show = ["Ticker", "Descripcion", "Objetivo", "Peso_pct", "Clase", "TIR", "MD",
                      "Monto_Invertido", "Precio_Compra", "VN_Comprado", "Valor_Actual", "Resultado_%"]
@@ -1178,8 +1297,9 @@ with tab_sim:
         st.markdown("### 📊 Simulación: compra el 29/6/2026 y seguimiento semanal")
         st.caption("Se compran los 8 instrumentos el día de la compra con el monto asignado, a precio de "
                    "mercado de ese día. De ahí en más los NOMINALES quedan fijos (sin rebalanceo): lo que "
-                   "cambia cada lunes es el precio. Tramo sólido = precio real de mercado. Tramo punteado = "
-                   "proyección por devengamiento a la TIR vigente hoy (no es una predicción de precios).")
+                   "cambia cada lunes es el precio EN PESOS = Paridad × indexación real (FX para los "
+                   "Dollar-Linked / USD, CER para el bono CER). Tramo sólido = precio real. Tramo punteado "
+                   "= proyección por devengamiento a la TIR vigente hoy (no es una predicción de FX).")
 
         cols_compra = ["Ticker", "Descripcion", "Peso_pct", "Monto_Invertido", "Precio_Compra", "VN_Comprado"]
         st.dataframe(port_compra[cols_compra].rename(columns={"Peso_pct": "Peso (%)"}),
@@ -1193,6 +1313,9 @@ with tab_sim:
         if sin_precio:
             st.warning(f"Sin precio de mercado en la fecha de compra para: **{', '.join(sin_precio)}** — "
                        f"no se pueden calcular sus nominales y quedan afuera de la simulación.")
+        if fx_diario is None:
+            st.warning("No hay serie de A3500 disponible: los Dollar-Linked se muestran sin ajuste de "
+                       "indexación (equivale a la Paridad cruda). Revisá la conexión al BCRA / modo demo.")
 
         st.divider()
         realizado = semanal[semanal["Estado"].isin(["Compra", "Hoy", "Realizado"])].sort_values("Date")
@@ -1215,10 +1338,10 @@ with tab_sim:
                 fig.add_vline(x=fecha_hito, line_dash="dot", line_color=COLORS["obj2"],
                               annotation_text=nombre, annotation_font_size=9, annotation_font_color=COLORS["obj2"])
 
-        fig.update_layout(title="Valor de la cartera cada lunes (nominales fijos desde la compra)",
+        fig.update_layout(title="Valor de la cartera cada lunes (nominales fijos, precio en pesos ajustado por indexación)",
                            height=440, **PLOTLY_LAYOUT)
         style_axes(fig, "Fecha", "Valor de la cartera (ARS)")
-        watermark(fig, as_of_hoy, "Alphacast" if not modo_demo else "Ejemplo")
+        watermark(fig, as_of_hoy, "Alphacast + BCRA" if not modo_demo else "Ejemplo")
         st.plotly_chart(fig, use_container_width=True, key=f"sim_valor_{fecha_compra}_{fecha_fin_sim}")
 
         fig2 = px.bar(semanal.iloc[1:], x="Date", y="Rendimiento_Semanal_%",
@@ -1253,7 +1376,8 @@ with tab_bench:
         st.markdown("### 📐 Comparación con Benchmarks")
         st.caption("A3500 y CER: API pública del BCRA (sin API key). SHY (ETF de bonos del Tesoro de "
                    "EE.UU. 1-3 años, convertido a pesos vía A3500): API pública de Yahoo Finance. Todo "
-                   "en base 100 al día de la compra.")
+                   "en base 100 al día de la compra. La CARTERA usa precio en pesos ajustado por "
+                   "indexación (FX/CER) — por eso ahora queda alineada con el A3500, no planchada debajo.")
 
         desde_bm = fecha_compra
         hasta_bm = pd.Timestamp(semanal["Date"].max())
@@ -1283,6 +1407,8 @@ with tab_bench:
                                   line=dict(width=1.8, color=COLORS["cer"], dash="dash")))
         fig.add_trace(go.Scatter(x=bench_tabla["Date"], y=bench_tabla["idx_SHY_ars"], mode="lines",
                                   name="SHY (en pesos)", line=dict(width=1.8, color=COLORS["accent"], dash="dot")))
+        fig.add_trace(go.Scatter(x=bench_tabla["Date"], y=bench_tabla["idx_total_bench"], mode="lines",
+                                  name="Benchmark compuesto", line=dict(width=2.2, color=COLORS["ok"])))
         fig.add_vline(x=as_of_hoy, line_dash="dash", line_color="#94a3b8", annotation_text="Hoy")
         fig.update_layout(title="Cartera vs. Benchmarks (índice base 100 desde la compra)",
                            height=440, **PLOTLY_LAYOUT)
@@ -1293,7 +1419,10 @@ with tab_bench:
         st.caption(f"Benchmark compuesto — Objetivo 1: {pesos_bench['w_cer_in_obj1']*100:.0f}% CER + "
                    f"{pesos_bench['w_shy_in_obj1']*100:.0f}% SHY(en pesos) · Objetivo 2: 100% A3500 · "
                    f"Total: {pesos_bench['peso_obj1']:.1f}% × benchmark Obj.1 + {pesos_bench['peso_obj2']:.1f}% "
-                   f"× benchmark Obj.2 (misma estructura que 'Medición de Desempeño' del IPS).")
+                   f"× benchmark Obj.2 (misma estructura que 'Medición de Desempeño' del IPS). Como la "
+                   f"cartera es 86% Dollar-Linked, su índice debería seguir de cerca al A3500 y al "
+                   f"benchmark compuesto — si ves una divergencia grande, es señal real de tracking, no un "
+                   f"artefacto de la Paridad.")
 
         ultimos = bench_tabla.dropna(subset=["idx_A3500"])
         if not ultimos.empty:
@@ -1302,7 +1431,7 @@ with tab_bench:
             c1.metric("Cartera (acumulado)", f"{cartera_idx.iloc[-1] - 100:+.1f}%")
             c2.metric("A3500 (acumulado)", f"{u['idx_A3500'] - 100:+.1f}%")
             c3.metric("CER (acumulado)", f"{u['idx_CER'] - 100:+.1f}%" if pd.notna(u["idx_CER"]) else "—")
-            c4.metric("SHY en pesos (acumulado)", f"{u['idx_SHY_ars'] - 100:+.1f}%" if pd.notna(u["idx_SHY_ars"]) else "—")
+            c4.metric("Benchmark compuesto", f"{u['idx_total_bench'] - 100:+.1f}%" if pd.notna(u["idx_total_bench"]) else "—")
 
         st.divider()
         st.markdown("### 📊 Ratios de riesgo-retorno — Objetivo 1 (Capital de Trabajo)")
@@ -1313,24 +1442,31 @@ with tab_bench:
 
         semanas_ext = st.slider("Semanas de historia para calcular estos ratios y la cobertura de Objetivo 2",
                                  min_value=8, max_value=104, value=26, step=2,
-                                 help="Amplía la muestra hacia atrás usando una serie ponderada por peso "
-                                      "(no por VN comprado) de los mismos instrumentos — SOLO para que "
-                                      "estos indicadores tengan una base estadística más razonable que "
-                                      "las pocas semanas reales desde la compra. Se usa tanto para los "
-                                      "ratios de Objetivo 1 como para el Hedge Ratio de Objetivo 2, más abajo.")
+                                 help="Amplía la muestra hacia atrás usando una serie de PRECIO EN PESOS "
+                                      "ajustado por indexación (FX/CER), ponderada por peso — SOLO para que "
+                                      "estos indicadores tengan una base estadística más razonable que las "
+                                      "pocas semanas reales desde la compra. Se usa tanto para los ratios de "
+                                      "Objetivo 1 como para el Hedge Ratio de Objetivo 2, más abajo.")
 
         obj1_tickers = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Ticker"].tolist()
         obj2_tickers = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Ticker"].tolist()
+
+        # Series de indexación para la ventana extendida (más atrás que la compra).
+        _ini_ext_probe = as_of_hoy - pd.Timedelta(weeks=int(semanas_ext))
+        if modo_demo:
+            df_bench_ext = synthetic_benchmark_series(_ini_ext_probe.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))
+            df_shy_ext = df_bench_ext[["Date", "SHY"]].rename(columns={"SHY": "Valor"})
+            df_bench_ext = df_bench_ext[["Date", "A3500", "CER"]]
+        else:
+            df_bench_ext = fetch_benchmark_bcra(_ini_ext_probe.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))
+            df_shy_ext = fetch_shy_series(_ini_ext_probe.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))
+        fx_ext = df_bench_ext.dropna(subset=["A3500"]).set_index("Date")["A3500"] if "A3500" in df_bench_ext.columns else None
+        cer_ext = df_bench_ext.dropna(subset=["CER"]).set_index("Date")["CER"] if "CER" in df_bench_ext.columns else None
+
         ext_ret, ext_faltan, fecha_inicio_ext = extended_weekly_returns(
-            port_df, df_norm, obj1_tickers, as_of_hoy, semanas_ext)
+            port_df, df_norm, obj1_tickers, as_of_hoy, semanas_ext, fx_diario=fx_ext, cer_diario=cer_ext)
         n_semanas_ext = int(ext_ret["ret"].notna().sum())
 
-        df_bench_ext = fetch_benchmark_bcra(fecha_inicio_ext.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d")) \
-            if not modo_demo else synthetic_benchmark_series(fecha_inicio_ext.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))
-        df_shy_ext = fetch_shy_series(fecha_inicio_ext.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d")) \
-            if not modo_demo else df_bench_ext[["Date", "SHY"]].rename(columns={"SHY": "Valor"})
-        if modo_demo:
-            df_bench_ext = df_bench_ext[["Date", "A3500", "CER"]]
         bench_ext, _ = build_benchmark_table(port_df, pd.DatetimeIndex(ext_ret["Date"]), df_bench_ext, df_shy_ext)
 
         if n_semanas_ext < 8:
@@ -1338,15 +1474,14 @@ with tab_bench:
                        f"({fecha_inicio_ext.strftime('%d/%m/%Y')} en adelante). Con tan poca muestra, estos "
                        f"ratios siguen siendo poco confiables — probá ampliar la ventana si el dataset lo permite.")
         if ext_faltan:
-            st.caption(f"Sin ninguna historia en el dataset para: **{', '.join(ext_faltan)}** dentro de la "
+            st.caption(f"Sin ninguna historia utilizable para: **{', '.join(ext_faltan)}** dentro de la "
                        f"ventana elegida — quedan afuera del cálculo (no se les asume retorno cero).")
 
         merged_ext = ext_ret.merge(bench_ext, on="Date", how="left")
 
-        # Sharpe/Sortino SIN tasa libre de riesgo (retorno/desvío puro). Restar la TNA
-        # de la caución (una tasa nominal alta, ~30%) contra retornos de precio (Paridad)
-        # de instrumentos de menor volatilidad exagera el "excess return" negativo y
-        # distorsiona el número — por eso se usa rf=0 acá.
+        # Sharpe/Sortino SIN restar tasa libre de riesgo (retorno/desvío puro):
+        # ahora los retornos son de precio en pesos y ya incorporan la indexación,
+        # pero restar una TNA nominal alta sigue distorsionando el excess return.
         sh = sharpe_ratio(merged_ext["ret"], 0.0)
         so = sortino_ratio(merged_ext["ret"], 0.0)
         ir = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
@@ -1358,33 +1493,37 @@ with tab_bench:
         r4.metric("N° semanas usadas", f"{n_semanas_ext}")
         st.caption("Sharpe = retorno medio semanal ÷ desvío semanal (anualizado ×√52) — **sin** restar la "
                    "TNA de la caución. Sortino: igual, pero el desvío solo considera semanas con retorno "
-                   "negativo. Se omite la tasa libre de riesgo porque estos retornos vienen de la Paridad "
-                   "(precio de mercado) y no siempre son directamente comparables contra una tasa nominal "
-                   "de money-market — restarla puede exagerar artificialmente un Sharpe negativo. "
-                   f"Benchmark del Information Ratio: el compuesto de Objetivo 1 (CER + SHY). "
+                   "negativo. Los retornos salen del precio en pesos ajustado por indexación (FX/CER), no "
+                   "de la Paridad. Benchmark del Information Ratio: el compuesto de Objetivo 1 (CER + SHY). "
                    f"Ventana usada: {fecha_inicio_ext.strftime('%d/%m/%Y')} → {as_of_hoy.strftime('%d/%m/%Y')}.")
 
         st.divider()
         st.markdown("### 🛡️ Efectividad de Cobertura — Objetivo 2 y Cartera Total")
         st.caption("Objetivo 2 y la Cartera Total (86% Dollar-Linked) no buscan retorno ajustado por "
                    "riesgo: buscan CALZAR una obligación en dólares. Por eso se miden con métricas de "
-                   "cobertura, no con Sharpe/Sortino/Information Ratio.")
+                   "cobertura (dollar-offset), no con Sharpe/Sortino/Information Ratio.")
 
         st.markdown("**Objetivo 2 · Calidad del hedge (dollar-offset)**")
+        st.info("✅ **Cálculo corregido.** El Hedge Ratio ahora compara el **precio en pesos** del "
+                "instrumento (Paridad × A3500/A3500(ancla)) contra la devaluación del A3500 — es decir, "
+                "mide la cobertura REAL frente al tipo de cambio. Antes usaba la Paridad sola, que le "
+                "restaba justamente la devaluación que el bono está diseñado para capturar, y por eso "
+                "daba artificialmente bajo. Un Hedge Ratio ≈100% = calza 1:1 con la devaluación; >100% = "
+                "captura además el spread propio del Dollar-Linked.")
 
         primeras_fechas_obj2 = primer_dato_disponible(df_norm, obj2_tickers)
         txt_primeras = " · ".join(
             f"{t}: {f.strftime('%d/%m/%Y') if f is not None else 'sin dato en el dataset'}"
             for t, f in primeras_fechas_obj2.items())
-        st.caption(f"📅 Primera fecha con precio disponible en el dataset (sin importar la ventana elegida "
-                   f"arriba, que ya pide {semanas_ext} semanas hacia atrás) — {txt_primeras}. Si el dataset "
-                   f"ya no tiene más historia que esa, ampliar la ventana **no agrega nada**: no es un límite "
-                   f"de cuánto pedimos, es dónde arranca la cotización real de cada papel (instrumentos jóvenes).")
+        st.caption(f"📅 Primera fecha con precio disponible en el dataset — {txt_primeras}. Si el dataset "
+                   f"ya no tiene más historia que esa, ampliar la ventana **no agrega nada**: es dónde "
+                   f"arranca la cotización real de cada papel (instrumentos jóvenes).")
 
         st.markdown("*Cada bono con su propia ventana real (sin mezclar el hueco de datos de uno con el otro):*")
         filas_por_ticker = []
         for tk in obj2_tickers:
-            ret_tk, _, _ = extended_weekly_returns(port_df, df_norm, [tk], as_of_hoy, semanas_ext)
+            ret_tk, _, _ = extended_weekly_returns(port_df, df_norm, [tk], as_of_hoy, semanas_ext,
+                                                    fx_diario=fx_ext, cer_diario=cer_ext)
             merged_tk = ret_tk.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
             merged_tk["ret_A3500"] = merged_tk["A3500"].pct_change()
             validos_tk = merged_tk.dropna(subset=["ret"])
@@ -1412,22 +1551,19 @@ with tab_bench:
                          "Hedge_Ratio": st.column_config.NumberColumn("Hedge Ratio", format="%.0f%%"),
                          "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
                      })
-        st.caption("Este desglose es el más confiable de los tres: cada bono se compara contra el A3500 "
-                   "únicamente en las semanas donde ESE bono en particular tiene precio — sin que la falta "
-                   "de historia de uno contamine al otro. Si acá ves pocas 'N° semanas propias', no es un "
-                   "problema de ventana pedida: es que el papel recién empezó a cotizar.")
+        st.caption("Cada bono se compara contra el A3500 únicamente en las semanas donde ESE bono tiene "
+                   "precio — sin que la falta de historia de uno contamine al otro. El retorno del bono ya "
+                   "es en pesos (ajustado por FX), así que el Hedge Ratio debería rondar el 100%.")
 
         st.markdown("*Análisis diario (mismo calendario, más observaciones):*")
         fechas_reales_validas = [f for f in primeras_fechas_obj2.values() if f is not None]
         if fechas_reales_validas:
             fecha_tope_diaria = max(fechas_reales_validas)  # el que arrancó más tarde = el límite común
             ticker_tope = [t for t, f in primeras_fechas_obj2.items() if f == fecha_tope_diaria][0]
-            st.caption(f"No hay más calendario para pedir hacia atrás ({ticker_tope} se emitió/empezó a "
-                       f"cotizar el {fecha_tope_diaria.strftime('%d/%m/%Y')}), pero **dentro de esas mismas "
-                       f"semanas** se puede mirar día por día en vez de solo los lunes — mucha más muestra "
-                       f"sin pedirle al dataset historia que no tiene. Hedge Ratio calculado **directo** "
-                       f"(último precio ÷ primer precio, como en Excel) — no encadenando retornos día a día, "
-                       f"que se distorsiona con los huecos de cotización.")
+            st.caption(f"No hay más calendario para pedir hacia atrás ({ticker_tope} empezó a cotizar el "
+                       f"{fecha_tope_diaria.strftime('%d/%m/%Y')}), pero dentro de esas semanas se puede "
+                       f"mirar día por día. Hedge Ratio calculado **directo** (último ÷ primer precio en "
+                       f"pesos, como en Excel) — no encadenando retornos día a día.")
 
             if modo_demo:
                 a3500_diario_df = synthetic_benchmark_series(
@@ -1440,16 +1576,16 @@ with tab_bench:
             a3500_diario = a3500_diario_df.set_index("Date")["Valor"]
 
             filas_diario = []
-            precios_por_ticker = {}
             for tk in obj2_tickers:
-                precio_tk = daily_price_series_ticker(df_norm, tk, fecha_tope_diaria, as_of_hoy)
-                precios_por_ticker[tk] = precio_tk
+                # Precio EN PESOS diario ajustado por FX (no Paridad cruda).
+                precio_tk = peso_price_series(df_norm, tk, a3500_diario, None, fecha_tope_diaria, as_of_hoy)
                 m = hedge_ratio_directo(precio_tk, a3500_diario)
                 filas_diario.append(dict(
                     Ticker=tk, N_obs_diarias=m["n"],
                     Desde=m["desde"], Hasta=m["hasta"],
                     Hedge_Ratio=m["hedge_ratio"], Correlacion=m["corr"]))
-            indice_obj2_diario = price_index_multi(port_df, df_norm, obj2_tickers, fecha_tope_diaria, as_of_hoy)
+            indice_obj2_diario = price_index_multi(port_df, df_norm, obj2_tickers, fecha_tope_diaria, as_of_hoy,
+                                                    fx_diario=a3500_diario)
             m_comb = hedge_ratio_directo(indice_obj2_diario, a3500_diario)
             filas_diario.append(dict(
                 Ticker="Objetivo 2 (combinado)", N_obs_diarias=m_comb["n"],
@@ -1465,12 +1601,10 @@ with tab_bench:
                              "Hedge_Ratio": st.column_config.NumberColumn("Hedge Ratio", format="%.0f%%"),
                              "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
                          })
-            n_semanal_equiv = int(np.ceil((as_of_hoy - fecha_tope_diaria).days / 7))
-            st.caption(f"Con el mismo calendario, la versión semanal daba ~{n_semanal_equiv} observaciones "
-                       f"por ticker; la diaria da hasta {int(tabla_diaria['N_obs_diarias'].max())}. Sigue "
-                       f"aplicando el mismo caveat de Paridad-vs-Valor-Técnico de más arriba — más "
-                       f"observaciones no lo resuelve si el problema es metodológico, pero si es de "
-                       f"muestra chica, esto ya debería estabilizar bastante los números.")
+            if not tabla_diaria.empty and tabla_diaria["N_obs_diarias"].notna().any():
+                st.caption(f"Máximo de observaciones diarias por ticker: "
+                           f"{int(tabla_diaria['N_obs_diarias'].max())}. Al ser precio en pesos ya "
+                           f"ajustado por FX, el Hedge Ratio combinado debería quedar cerca de 100%.")
 
             with st.expander("🔍 Ver el dataset DIARIO con el que se calcula esta tabla (para auditar)"):
                 crudo_d = df_norm[(df_norm["Ticker"].isin(obj2_tickers)) & (df_norm["Date"] >= fecha_tope_diaria) &
@@ -1481,16 +1615,12 @@ with tab_bench:
                 piv_tir_d.columns = [f"TIR_{c}" for c in piv_tir_d.columns]
 
                 auditoria_d = pd.DataFrame({"Date": indice_obj2_diario.index,
-                                             "Indice_Obj2_ponderado": indice_obj2_diario.values})
+                                             "Precio_pesos_Obj2_ponderado": indice_obj2_diario.values})
                 auditoria_d = auditoria_d.merge(a3500_diario_df.rename(columns={"Valor": "A3500"}), on="Date", how="outer")
                 auditoria_d = auditoria_d.merge(piv_paridad_d.reset_index(), on="Date", how="outer")
                 auditoria_d = auditoria_d.merge(piv_tir_d.reset_index(), on="Date", how="outer")
                 auditoria_d = auditoria_d[(auditoria_d["Date"] >= fecha_tope_diaria) & (auditoria_d["Date"] <= as_of_hoy)]
 
-                # Filtramos las filas TOTALMENTE vacías (ni precio de ningún
-                # ticker, ni A3500) — no aportan nada y solo ensucian la vista.
-                # Las filas con dato PARCIAL (ej. cotizó un bono pero no el
-                # otro) se mantienen a propósito: son las que hay que auditar.
                 cols_dato = [c for c in auditoria_d.columns if c.startswith("Paridad_")] + ["A3500"]
                 antes = len(auditoria_d)
                 auditoria_d = auditoria_d[auditoria_d[cols_dato].notna().any(axis=1)]
@@ -1498,15 +1628,15 @@ with tab_bench:
 
                 st.dataframe(auditoria_d.sort_values("Date"), use_container_width=True, height=320,
                              column_config={
-                                 "Indice_Obj2_ponderado": st.column_config.NumberColumn("Índice Obj.2 (ponderado)", format="%.2f"),
+                                 "Precio_pesos_Obj2_ponderado": st.column_config.NumberColumn("Precio en pesos Obj.2 (ponderado, base=Paridad×FX)", format="%.2f"),
                                  "A3500": st.column_config.NumberColumn("A3500", format="%.1f"),
                              })
                 st.caption(f"Grilla de DÍAS HÁBILES desde {fecha_tope_diaria.strftime('%d/%m/%Y')} hasta "
-                           f"{as_of_hoy.strftime('%d/%m/%Y')} — distinta de la tabla semanal de más abajo. "
-                           f"Se filtraron {filtradas} fila(s) sin ningún dato (feriados/no laborables). Un "
-                           f"Paridad_ vacío en una fila que sí quedó es normal si ese papel puntual no operó "
-                           f"ese día (iliquidez) — no significa que falte cargar nada, y el cálculo de Hedge "
-                           f"Ratio ya lo excluye correctamente (no lo cuenta como retorno cero).")
+                           f"{as_of_hoy.strftime('%d/%m/%Y')}. Se filtraron {filtradas} fila(s) sin ningún "
+                           f"dato. La columna 'Precio en pesos Obj.2' es Paridad × (A3500/A3500 en la fecha "
+                           f"de ancla) ponderado — fijate cómo sube con el A3500, a diferencia de la "
+                           f"Paridad_ cruda de cada ticker, que se mantiene casi plana. Esa diferencia es "
+                           f"exactamente el bug que se corrigió.")
                 csv_auditoria_d = auditoria_d.to_csv(index=False).encode("utf-8")
                 st.download_button("⬇️ Descargar dataset DIARIO de auditoría (CSV)", data=csv_auditoria_d,
                                     file_name=f"auditoria_hedge_diario_obj2_{as_of_hoy.strftime('%Y%m%d')}.csv",
@@ -1515,21 +1645,13 @@ with tab_bench:
             st.info("Ningún ticker de Objetivo 2 tiene dato en el dataset — no se puede armar el análisis diario.")
 
         ext_ret_obj2, ext_faltan_obj2, _ = extended_weekly_returns(
-            port_df, df_norm, obj2_tickers, as_of_hoy, semanas_ext)
+            port_df, df_norm, obj2_tickers, as_of_hoy, semanas_ext, fx_diario=fx_ext, cer_diario=cer_ext)
         merged_obj2 = ext_ret_obj2.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
         merged_obj2["ret_A3500"] = merged_obj2["A3500"].pct_change()
         n_semanas_hedge = int(merged_obj2["ret"].notna().sum())
 
-        # IMPORTANTE: acumular ambas series (Objetivo 2 y A3500) sobre el MISMO
-        # sub-período con dato real de Objetivo 2 — nunca completar con 0% los
-        # huecos de un lado y no del otro. Rellenar con 0 solo la cartera (porque
-        # D31M7/D30S6 son instrumentos jóvenes y no tienen historia en todo el
-        # rango pedido) mientras el A3500 sí acumula devaluación en esas mismas
-        # semanas "vacías" infla artificialmente la devaluación del denominador
-        # y hunde el Hedge Ratio, aunque la cobertura esté funcionando bien.
         st.markdown("*Objetivo 2 combinado (D31M7 + D30S6 ponderado — se recalcula el peso relativo cada "
-                    "semana entre los que sí tienen dato; puede quedar dominado por un solo papel si el "
-                    "otro todavía no cotizaba):*")
+                    "semana entre los que sí tienen dato):*")
         validos_obj2 = merged_obj2.dropna(subset=["ret"])
         if len(validos_obj2) >= 8:
             fecha_ini_valida = validos_obj2["Date"].iloc[0]
@@ -1545,29 +1667,17 @@ with tab_bench:
                       "100% = calzó 1:1 con la devaluación")
             h2.metric("Correlación semanal vs. A3500", f"{corr_obj2_a3500:.2f}" if pd.notna(corr_obj2_a3500) else "—")
             h3.metric("N° semanas usadas", f"{n_semanas_hedge}")
-            st.caption(f"Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, "
-                       f"ambos calculados sobre el **mismo período con dato real**: "
+            st.caption(f"Hedge Ratio = retorno acumulado EN PESOS de Objetivo 2 ÷ devaluación acumulada de "
+                       f"A3500, sobre el mismo período con dato real: "
                        f"{fecha_ini_valida.strftime('%d/%m/%Y')} → {fecha_fin_valida.strftime('%d/%m/%Y')} "
-                       f"({n_semanas_hedge} semanas). >100%: la cobertura rindió por encima de la pura "
-                       f"devaluación (spread propio de los DL). <100%: quedó por detrás.")
-
-            st.warning(
-                "⚠️ **Posible límite metodológico, no solo de muestra.** Este cálculo usa la *Paridad* "
-                "(Precio de mercado ÷ Valor Técnico) de Alphacast. Para un bono indexado (Dollar-Linked o "
-                "CER), el **Valor Técnico ya incorpora la indexación** (crece con la devaluación o la "
-                "inflación) — si la Paridad se mantiene relativamente estable, el bono puede estar "
-                "devengando esa indexación *perfectamente* sin que se note en el retorno que estoy "
-                "calculando acá (que solo mide la Paridad, no el Valor Técnico). En otras palabras: **un "
-                "Hedge Ratio bajo acá no prueba necesariamente que la cobertura esté fallando** — puede "
-                "ser que el cálculo le esté restando al DL su propio devengamiento por tipo de cambio. "
-                "No tengo forma de confirmar esto sin acceso a Valor Técnico o Precio pleno del dataset — "
-                "quedás mejor posicionado que yo para chequearlo con la mesa o soporte de Alphacast. "
-                "Mientras tanto, usá la tabla de abajo para auditar dato por dato.")
+                       f"({n_semanas_hedge} semanas). El retorno de Objetivo 2 ya incorpora la "
+                       f"indexación por FX, así que ≈100% confirma que la cobertura funciona; >100% = "
+                       f"además capturó el spread propio de los DL; <100% = quedó por detrás.")
         else:
             st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
                        f"muy poco para que el Hedge Ratio o la correlación signifiquen algo.")
         if ext_faltan_obj2:
-            st.caption(f"Sin ninguna historia en el dataset para: **{', '.join(ext_faltan_obj2)}** dentro "
+            st.caption(f"Sin ninguna historia utilizable para: **{', '.join(ext_faltan_obj2)}** dentro "
                        f"de la ventana elegida.")
 
         with st.expander("🔍 Ver el dataset SEMANAL con el que se calcula el Hedge Ratio de arriba (para auditar)"):
@@ -1577,20 +1687,19 @@ with tab_bench:
             piv_paridad.columns = [f"Paridad_{c}" for c in piv_paridad.columns]
             piv_tir.columns = [f"TIR_{c}" for c in piv_tir.columns]
             auditoria = merged_obj2[["Date", "ret", "A3500", "ret_A3500"]].rename(
-                columns={"ret": "Retorno_Obj2_ponderado", "ret_A3500": "Retorno_A3500"})
+                columns={"ret": "Retorno_Obj2_pesos_ponderado", "ret_A3500": "Retorno_A3500"})
             auditoria = auditoria.merge(piv_paridad.reset_index(), on="Date", how="left")
             auditoria = auditoria.merge(piv_tir.reset_index(), on="Date", how="left")
             st.dataframe(auditoria.sort_values("Date"), use_container_width=True, height=320,
                          column_config={
-                             "Retorno_Obj2_ponderado": st.column_config.NumberColumn("Retorno Obj.2 (ponderado)", format="%.3f%%"),
+                             "Retorno_Obj2_pesos_ponderado": st.column_config.NumberColumn("Retorno Obj.2 en pesos (ponderado)", format="%.3f%%"),
                              "A3500": st.column_config.NumberColumn("A3500", format="%.1f"),
                              "Retorno_A3500": st.column_config.NumberColumn("Retorno A3500", format="%.3f%%"),
                          })
-            st.caption("Filas = todas las fechas semanales de la ventana elegida (columna Date). "
-                       "Paridad_/TIR_ = dato crudo de Alphacast por ticker, sin transformar. "
-                       "Retorno Obj.2 (ponderado) = el retorno semanal ya combinado por peso relativo entre "
-                       "D31M7 y D30S6 (lo que alimenta el Hedge Ratio de arriba). Si un Paridad_ viene vacío, "
-                       "es porque ese ticker no cotizó (o no existía) esa semana en el dataset.")
+            st.caption("El 'Retorno Obj.2 en pesos' es el retorno semanal del precio en pesos (Paridad × "
+                       "FX), combinado por peso entre D31M7 y D30S6 — lo que alimenta el Hedge Ratio. "
+                       "Comparalo con el 'Retorno A3500' de la misma fila: si son parecidos, la cobertura "
+                       "está trackeando la devaluación semana a semana.")
             csv_auditoria = auditoria.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Descargar dataset SEMANAL de auditoría (CSV)", data=csv_auditoria,
                                 file_name=f"auditoria_hedge_semanal_obj2_{as_of_hoy.strftime('%Y%m%d')}.csv",
@@ -1627,18 +1736,18 @@ with tab_bench:
                          "Valor_Obj2_USD": st.column_config.NumberColumn("Valor Objetivo 2 (USD)", format="US$ %.0f"),
                          "Cobertura_pct": st.column_config.NumberColumn("Cobertura", format="%.0f%%"),
                      })
-        st.caption("Convierte el valor de Objetivo 2 (D31M7+D30S6, realizado o proyectado según la fecha) "
-                   "a USD con el A3500 de esa misma fecha, y lo compara contra el monto en USD que exige "
-                   "cada hito del cronograma de desembolsos (según la fecha de desembolso del préstamo, "
-                   "en la barra lateral). ≥100% = la cobertura alcanza para ese hito.")
+        st.caption("Convierte el valor EN PESOS de Objetivo 2 (D31M7+D30S6, ya ajustado por FX, realizado o "
+                   "proyectado según la fecha) a USD con el A3500 de esa misma fecha, y lo compara contra el "
+                   "monto en USD que exige cada hito del cronograma. Como el valor en pesos ya sube con el "
+                   "FX, el valor en USD debería mantenerse relativamente estable (esa es la esencia de la "
+                   "cobertura). ≥100% = alcanza para ese hito.")
 
     # ---------------------------------------------------------------------
-    # TAB 5 — Brecha Cambiaria
+    # TAB 4 — Brecha Cambiaria
     # ---------------------------------------------------------------------
 with tab_brecha:
     st.markdown("### 💵 Dólar y Brecha Cambiaria")
     st.caption("Oficial, minorista y bandas de flotación: API pública del BCRA (no requiere API key). "
-
                "MEP y CCL: dataset de Alphacast — mismo mecanismo de API key que el resto del panel.")
 
     cb1, cb2 = st.columns(2)
@@ -1750,7 +1859,7 @@ with tab_brecha:
                             file_name=f"brecha_cambiaria_{hasta_brecha.strftime('%Y%m%d')}.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------
-# TAB 6 — Metodología
+# TAB 5 — Metodología
 # ---------------------------------------------------------------------
 with tab_metodo:
     st.markdown("""
@@ -1760,49 +1869,76 @@ with tab_metodo:
     usado en el panel PRO de Renta Fija. Trae TIR (`irr`), Modified Duration, Paridad, segmento de
     mercado (Sovereign/Corporate) y estructura de cupón por ticker y fecha.
 
+    ---
+    #### ⚠️ Corrección clave: Paridad ≠ precio en pesos para instrumentos indexados
+
+    La **Paridad** de Alphacast = Precio de mercado ÷ Valor Técnico. Para un bono **no indexado**
+    (una LECAP como S31L6), el Valor Técnico es estable y la Paridad se parece al precio en pesos.
+    Pero para un bono **indexado** el Valor Técnico NO es constante:
+
+    - **Dollar-Linked** (D31M7, D30S6) y **Hard-Dollar / soberano en USD** (TLCQO, LOC5O, AO27):
+      el Valor Técnico se mueve 1:1 con el **A3500** (tipo de cambio oficial).
+    - **CER** (TZXD6): el Valor Técnico se mueve con el **CER** (inflación).
+
+    Si se usa la Paridad sola como "precio en pesos", se le **resta al instrumento toda su indexación**:
+    un Dollar-Linked que está cubriendo perfectamente muestra una Paridad casi plana, y su "retorno"
+    calculado da ~0 — aunque en pesos el bono valga muchísimo más por la devaluación. Ese era el bug:
+    la cartera (86% DL) aparecía muy por debajo del A3500 y el Hedge Ratio salía artificialmente bajo.
+
+    **Corrección aplicada:** el precio en pesos de cada instrumento indexado se reconstruye como
+
+    > **Precio_pesos(t) = Paridad(t) × [ Índice(t) / Índice(ancla) ]**
+
+    donde *Índice* es el A3500 (FX) o el CER según el instrumento, y *ancla* es la fecha de compra
+    (o el primer dato del papel). No se necesita ni la fecha de emisión ni el Valor Técnico nominal
+    real: como solo importan retornos relativos, alcanza con anclar el VT y hacerlo crecer con el
+    índice real. Todo el motor (simulación semanal, valor de la cartera, benchmark, Hedge Ratio y
+    ratios de riesgo) opera ahora sobre este **precio en pesos**, no sobre la Paridad cruda.
+
+    ---
+
     **Simulación de compra (29/6/2026):** el monto asignado a cada instrumento (Peso_pct × monto total)
-    se convierte a **nominales (VN)** dividiendo por la Paridad de esa fecha exacta. Para la caución, el
-    "VN" es directamente el monto invertido (no hay concepto de paridad).
+    se convierte a **nominales (VN)** dividiendo por la Paridad de esa fecha exacta. En la fecha de
+    compra el factor de indexación vale 1, así que esto no cambia. Para la caución, el "VN" es
+    directamente el monto invertido.
 
-    **Simulación semanal:** a partir de la compra, los nominales quedan **fijos** (sin rebalanceo). Cada
-    lunes se recalcula el valor de la cartera como VN × Paridad/100 (bonos) o devengamiento por TNA
-    (caución). Los lunes con fecha ≤ hoy usan Paridad real de Alphacast; los posteriores se proyectan
-    devengando la TIR vigente hoy de cada instrumento — es el piso esperado por carry, no una predicción
-    de precios de mercado.
+    **Simulación semanal:** los nominales quedan **fijos** (sin rebalanceo). Cada lunes el valor de
+    cada bono = VN × (Paridad × factor de indexación)/100; la caución devenga por TNA. Los lunes con
+    fecha ≤ hoy usan Paridad real de Alphacast **más** la indexación real (FX/CER) desde la compra;
+    los posteriores se proyectan devengando la TIR vigente hoy — es el piso esperado por carry, **sin**
+    asumir devaluación futura (no es un pronóstico de tipo de cambio).
 
-    **Benchmarks (pestaña Benchmarks & Ratios):** A3500 y CER salen de la API pública del BCRA (idVariables
-    5 y 30). SHY (ETF de bonos del Tesoro de EE.UU. 1-3 años) sale de la API pública de Yahoo Finance, y se
-    convierte a pesos componiendo su retorno en USD con la devaluación de A3500. El benchmark de Objetivo 1
-    combina CER y SHY(en pesos) ponderados por el peso real de Tramo 1/2 y Tramo 3 dentro de Objetivo 1; el
-    de Objetivo 2 es 100% A3500; el de la Cartera Total pondera ambos por el peso de cada Objetivo — misma
-    estructura que la diapositiva "Medición de Desempeño" del IPS (TAMAR/CER para Tramo 1/2, ETF SHY para
-    Tramo 3, A3500 para la cobertura cambiaria).
+    **Benchmarks:** A3500 y CER salen de la API pública del BCRA (idVariables 5 y 30). SHY (ETF de bonos
+    del Tesoro de EE.UU. 1-3 años) sale de Yahoo Finance y se convierte a pesos componiendo su retorno
+    en USD con la devaluación de A3500. El benchmark de Objetivo 1 combina CER y SHY(en pesos)
+    ponderados por el peso real de Tramo 1/2 y Tramo 3; el de Objetivo 2 es 100% A3500; el de la Cartera
+    Total pondera ambos — misma estructura que "Medición de Desempeño" del IPS.
 
-    **Ratios de riesgo-retorno:** Sharpe y Sortino usan como tasa libre de riesgo la TNA de la caución;
-    Sortino solo penaliza la volatilidad a la baja. El Information Ratio compara el retorno activo (cartera
-    − su benchmark compuesto) contra el tracking error. Los tres se anualizan multiplicando por √52 y se
-    calculan únicamente sobre semanas ya REALIZADAS (nunca sobre las proyectadas) — con pocas semanas de
-    historia real, son poco representativos y la app lo advierte explícitamente.
+    **Efectividad de cobertura (Hedge Ratio, dollar-offset):** compara el **retorno en pesos** de
+    Objetivo 2 (ya ajustado por FX) contra la devaluación del A3500 sobre el mismo período con dato
+    real. ≈100% = la cobertura calzó 1:1 con la devaluación; >100% = capturó además el spread del DL;
+    <100% = quedó por detrás. Al medirse sobre el precio en pesos (y no sobre la Paridad), este número
+    ahora refleja la cobertura real.
 
-    **Brecha cambiaria:** Oficial (`Tipo de cambio mayorista de referencia`, idVariable 5), Minorista
-    (idVariable 4) y las bandas de flotación (`Régimen de bandas cambiarias — Límite inferior/superior`,
-    idVariables 1187/1188) salen de la **API pública del BCRA** (`api.bcra.gob.ar/estadisticas/v4.0`),
-    que no requiere API key y está verificada contra los valores históricos reales. MEP y CCL no son
-    series que el BCRA publique (surgen de operar bonos/acciones en distintas plazas): salen de
-    Alphacast, dataset "Markets - Argentina - FX premiums - Daily" (ID configurable en la pestaña).
-    La Brecha se calcula igual que en la planilla original: `(MEP − Oficial) / Oficial`.
+    **Ratios de riesgo-retorno (Objetivo 1):** Sharpe y Sortino se calculan sobre retornos en pesos,
+    sin restar tasa libre de riesgo (restar una TNA nominal alta distorsiona el excess return);
+    Sortino solo penaliza la volatilidad a la baja. El Information Ratio compara el retorno activo
+    (cartera − benchmark compuesto) contra el tracking error. Se anualizan con √52 y se advierte cuando
+    hay pocas semanas de historia.
 
-    **Composición de la cartera:** los 8 instrumentos exactos del IPS del Grupo 8, reconciliando los dos
-    gráficos de torta de la presentación (cartera consolidada $175M + detalle de Objetivo 1): **D31M7**
-    (79,1%) y **D30S6** (6,9%) — Dollar-Linked, cobertura FX, 86,0% del total — y dentro de Objetivo 1
-    (14,0%): **Cauciones** (1,4%), **S31L6** (1,4%), **TZXD6** (7,0%), **TLCQO** (2,1%), **LOC5O** (1,05%)
-    y **AO27** (1,05%). El único dato manual es la TNA de la caución.
+    **Brecha cambiaria:** Oficial (idVariable 5), Minorista (idVariable 4) y bandas de flotación
+    (idVariables 1187/1188) salen de la **API pública del BCRA**. MEP y CCL salen de Alphacast (dataset
+    "Markets - Argentina - FX premiums - Daily"). Brecha = `(MEP − Oficial) / Oficial`.
+
+    **Composición de la cartera:** los 8 instrumentos exactos del IPS del Grupo 8: **D31M7** (79,1%) y
+    **D30S6** (6,9%) — Dollar-Linked, cobertura FX, 86,0% del total — y dentro de Objetivo 1 (14,0%):
+    **Cauciones** (1,4%), **S31L6** (1,4%), **TZXD6** (7,0%), **TLCQO** (2,1%), **LOC5O** (1,05%) y
+    **AO27** (1,05%). El único dato manual es la TNA de la caución.
 
     **Cómo correr esto en Streamlit Cloud:**
     1. Subí `app.py` y `requirements.txt` a un repositorio de GitHub.
     2. En [share.streamlit.io](https://share.streamlit.io), creá una app apuntando a ese repo/`app.py`.
-    3. Cargá tu Alphacast API Key como *secret* (`ALPHACAST_API_KEY`) en la configuración de la app,
-       o pegala directamente en la barra lateral al abrir el panel.
+    3. Cargá tu Alphacast API Key como *secret* (`ALPHACAST_API_KEY`), o pegala en la barra lateral.
 
     ⚠️ Esta herramienta es de análisis y monitoreo académico. No constituye recomendación de inversión.
     """)
