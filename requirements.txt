@@ -4,3 +4,4 @@ numpy>=1.24
 plotly>=5.18
 alphacast>=0.1.6
 openpyxl>=3.1
+requests>=2.31
