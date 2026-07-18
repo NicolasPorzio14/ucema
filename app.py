@@ -615,6 +615,30 @@ def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
         if c not in aligned.columns:
             aligned[c] = np.nan
 
+    # Proyección del CER más allá de su último dato REAL. El BCRA publica el CER
+    # con rezago (~mediados de mes para el período anterior), así que sobre la
+    # grilla semanal el CER se "planchaba" por forward-fill unas semanas antes que
+    # el resto y dejaba de acumular. Para que el benchmark CER siga siendo
+    # comparable con la cartera proyectada, en el tramo futuro se lo hace crecer a
+    # la tasa de inflación reciente (últimos ~30 días de CER real) en vez de
+    # dejarlo fijo. Sobre ventanas que terminan en 'hoy' no cambia nada (no hay
+    # tramo futuro que proyectar).
+    if "CER" in df_bcra_bench.columns:
+        cer_real = df_bcra_bench[["Date", "CER"]].dropna().sort_values("Date")
+        if len(cer_real) >= 2:
+            last_date = pd.Timestamp(cer_real["Date"].iloc[-1])
+            last_val = float(cer_real["CER"].iloc[-1])
+            ventana = cer_real[cer_real["Date"] >= last_date - pd.Timedelta(days=30)]
+            if len(ventana) >= 2 and float(ventana["CER"].iloc[0]) > 0:
+                span_dias = max((ventana["Date"].iloc[-1] - ventana["Date"].iloc[0]).days, 1)
+                r_diaria = (float(ventana["CER"].iloc[-1]) / float(ventana["CER"].iloc[0])) ** (1.0 / span_dias) - 1
+            else:
+                r_diaria = 0.0
+            fut = aligned["Date"] > last_date
+            if fut.any():
+                dias_fut = (aligned.loc[fut, "Date"] - last_date).dt.days.astype(float)
+                aligned.loc[fut, "CER"] = last_val * (1 + r_diaria) ** dias_fut
+
     peso_obj1 = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Peso_pct"].sum()
     peso_obj2 = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Peso_pct"].sum()
     tramo12_tk = ["CAUCION", "S31L6", "TZXD6"]
@@ -1463,7 +1487,13 @@ with tab_bench:
         fig.update_layout(title="Cartera vs. Benchmarks (índice base 100 desde la compra)",
                            height=440, **PLOTLY_LAYOUT)
         style_axes(fig, "Fecha", "Índice (base 100)")
-        watermark(fig, hasta_bm, "BCRA + Yahoo Finance" if not modo_demo else "Ejemplo")
+        # El watermark debe mostrar la fecha de los DATOS REALES (hoy), no el fin del
+        # horizonte de proyección (hasta_bm ~ 31/12): el tramo a la derecha de "Hoy"
+        # es proyección, no dato. El horizonte se aclara aparte, en el título del eje.
+        watermark(fig, as_of_hoy, "BCRA + Yahoo Finance" if not modo_demo else "Ejemplo")
+        fig.update_layout(title=f"Cartera vs. Benchmarks (índice base 100 desde la compra · "
+                                f"realizado hasta {as_of_hoy.strftime('%d/%m/%Y')}, proyección hasta "
+                                f"{hasta_bm.strftime('%d/%m/%Y')})")
         st.plotly_chart(fig, use_container_width=True, key=f"bench_idx_{desde_bm}_{hasta_bm}")
 
         st.caption(f"Benchmark compuesto — Objetivo 1: {pesos_bench['w_cer_in_obj1']*100:.0f}% CER + "
@@ -1476,12 +1506,24 @@ with tab_bench:
 
         ultimos = bench_tabla.dropna(subset=["idx_A3500"])
         if not ultimos.empty:
-            u = ultimos.iloc[-1]
+            # Todos los KPIs se miden A HOY (fecha de datos reales), NO al fin del
+            # horizonte de proyección. Antes 'Cartera (acumulado)' usaba el último
+            # punto de la curva (31/12, proyectado) mientras la pestaña principal y
+            # la tabla semanal usaban 'hoy': daban números distintos (+0,9% vs
+            # −0,25%) para el mismo concepto. Ahora coinciden.
+            _mask_hoy = semanal["Date"] == as_of_hoy
+            cartera_acum_hoy = (float(cartera_idx[_mask_hoy].iloc[0]) - 100) if _mask_hoy.any() else (float(cartera_idx.iloc[-1]) - 100)
+            _u_hoy = bench_tabla[bench_tabla["Date"] == as_of_hoy]
+            u = _u_hoy.iloc[0] if not _u_hoy.empty else ultimos.iloc[-1]
+            _lbl = as_of_hoy.strftime("%d/%m/%Y")
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Cartera (acumulado)", f"{cartera_idx.iloc[-1] - 100:+.1f}%")
-            c2.metric("A3500 (acumulado)", f"{u['idx_A3500'] - 100:+.1f}%")
-            c3.metric("CER (acumulado)", f"{u['idx_CER'] - 100:+.1f}%" if pd.notna(u["idx_CER"]) else "—")
-            c4.metric("Benchmark compuesto", f"{u['idx_total_bench'] - 100:+.1f}%" if pd.notna(u["idx_total_bench"]) else "—")
+            c1.metric(f"Cartera (acum. a hoy)", f"{cartera_acum_hoy:+.1f}%", help=f"Acumulado desde la compra hasta {_lbl} (mismo criterio que la pestaña principal y la tabla semanal).")
+            c2.metric(f"A3500 (acum. a hoy)", f"{u['idx_A3500'] - 100:+.1f}%")
+            c3.metric(f"CER (acum. a hoy)", f"{u['idx_CER'] - 100:+.1f}%" if pd.notna(u["idx_CER"]) else "—")
+            c4.metric(f"Benchmark compuesto (a hoy)", f"{u['idx_total_bench'] - 100:+.1f}%" if pd.notna(u["idx_total_bench"]) else "—")
+            st.caption(f"Acumulados medidos **a hoy ({_lbl})**, coherentes con la pestaña 'Cartera Hoy' y la "
+                       f"tabla semanal. El tramo proyectado (a la derecha de 'Hoy' en el gráfico) no entra en "
+                       f"estos números.")
 
         st.divider()
         with st.expander("🔎 Dataset de auditoría — precio de CADA activo vs. CADA benchmark (base 100)", expanded=True):
@@ -1608,6 +1650,14 @@ with tab_bench:
             st.warning(f"⚠️ Solo **{n_semanas_ext} semana(s)** con dato utilizable en la ventana elegida "
                        f"({fecha_inicio_ext.strftime('%d/%m/%Y')} en adelante). Con tan poca muestra, estos "
                        f"ratios siguen siendo poco confiables — probá ampliar la ventana si el dataset lo permite.")
+        # El slider llega hasta 104 semanas, pero el dataset casi nunca tiene tanta
+        # historia (los papeles son jóvenes). Si se piden más semanas de las que hay
+        # dato, avisarlo: mover el slider más allá de este tope NO agrega muestra.
+        elif n_semanas_ext < semanas_ext:
+            st.info(f"ℹ️ Seleccionaste **{semanas_ext} semanas**, pero solo hay **{n_semanas_ext}** con dato "
+                    f"utilizable (desde {fecha_inicio_ext.strftime('%d/%m/%Y')}). Los ratios usan esas "
+                    f"{n_semanas_ext}; ampliar el slider por encima de ~{n_semanas_ext} semanas no agrega "
+                    f"historia porque el dataset no la tiene.")
         if ext_faltan:
             st.caption(f"Sin ninguna historia utilizable para: **{', '.join(ext_faltan)}** dentro de la "
                        f"ventana elegida — quedan afuera del cálculo (no se les asume retorno cero).")
@@ -1663,9 +1713,13 @@ with tab_bench:
         txt_primeras = " · ".join(
             f"{t}: {f.strftime('%d/%m/%Y') if f is not None else 'sin dato en el dataset'}"
             for t, f in primeras_fechas_obj2.items())
-        st.caption(f"📅 Primera fecha con precio disponible en el dataset — {txt_primeras}. Si el dataset "
-                   f"ya no tiene más historia que esa, ampliar la ventana **no agrega nada**: es dónde "
-                   f"arranca la cotización real de cada papel (instrumentos jóvenes).")
+        st.caption(f"📅 Primer **precio diario** disponible en el dataset — {txt_primeras}. Ojo: la columna "
+                   f"'Desde' de la tabla de abajo NO es esta fecha, sino la primera **semana con retorno** "
+                   f"válido, que cae ~1 semana después: el primer retorno semanal necesita una semana previa "
+                   f"para calcularse (pct_change), así que arranca en el primer lunes posterior al primer "
+                   f"precio. Las dos fechas son correctas; miden cosas distintas (primer precio vs. primer "
+                   f"retorno). Si el dataset no tiene más historia que esta, ampliar la ventana **no agrega "
+                   f"nada**: es dónde arranca la cotización real de cada papel (instrumentos jóvenes).")
 
         st.markdown("*Cada bono con su propia ventana real (sin mezclar el hueco de datos de uno con el otro):*")
         filas_por_ticker = []
@@ -1700,8 +1754,10 @@ with tab_bench:
                          "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
                      })
         st.caption("Cada bono se compara contra el A3500 únicamente en las semanas donde ESE bono tiene "
-                   "precio — sin que la falta de historia de uno contamine al otro. El retorno del bono ya "
-                   "es en pesos (ajustado por FX), así que el Hedge Ratio debería rondar el 100%.")
+                   "precio — sin que la falta de historia de uno contamine al otro. **'Desde' = primera "
+                   "semana con retorno válido** (≈1 semana después del primer precio diario citado arriba, "
+                   "porque el primer retorno necesita una semana previa). El retorno del bono ya es en pesos "
+                   "(ajustado por FX), así que el Hedge Ratio debería rondar el 100%.")
 
         st.markdown("*Análisis diario (mismo calendario, más observaciones):*")
         fechas_reales_validas = [f for f in primeras_fechas_obj2.values() if f is not None]
@@ -1858,11 +1914,14 @@ with tab_bench:
         hitos_usd = [("Mes 3 (obra civil)", 90, 7300), ("Mes 6 (obra civil)", 180, 10500),
                      ("Mes 9 (obra civil + maquinaria)", 270, 16700 + 50000)]
         filas_usd = []
+        usd_acumulado = 0.0  # los desembolsos son secuenciales: cada hito consume fondos
         for nombre, dias, monto_usd in hitos_usd:
+            usd_acumulado += monto_usd  # USD total exigido HASTA este hito inclusive
             fecha_hito = fecha_desembolso_ts + pd.Timedelta(days=dias)
             if fecha_hito < semanal["Date"].min() or fecha_hito > semanal["Date"].max():
-                filas_usd.append(dict(Hito=nombre, Fecha=fecha_hito, USD_Necesario=monto_usd,
-                                       Valor_Obj2_ARS=np.nan, FX=np.nan, Valor_Obj2_USD=np.nan, Cobertura_pct=np.nan))
+                filas_usd.append(dict(Hito=nombre, Fecha=fecha_hito, USD_Hito=monto_usd,
+                                       USD_Acumulado=usd_acumulado, Valor_Obj2_ARS=np.nan, FX=np.nan,
+                                       Valor_Obj2_USD=np.nan, Cobertura_hito_pct=np.nan, Cobertura_acum_pct=np.nan))
                 continue
             idx_cercano = (semanal["Date"] - fecha_hito).abs().idxmin()
             fila_sem = semanal.loc[idx_cercano]
@@ -1870,25 +1929,35 @@ with tab_bench:
             valor_obj2_ars = fila_sem.get("Valor_D31M7", 0.0) + fila_sem.get("Valor_D30S6", 0.0)
             fx = fila_bench.get("A3500", np.nan)
             valor_obj2_usd = valor_obj2_ars / fx if pd.notna(fx) and fx > 0 else np.nan
-            cobertura = (valor_obj2_usd / monto_usd * 100) if pd.notna(valor_obj2_usd) else np.nan
-            filas_usd.append(dict(Hito=nombre, Fecha=fila_sem["Date"], USD_Necesario=monto_usd,
-                                   Valor_Obj2_ARS=valor_obj2_ars, FX=fx, Valor_Obj2_USD=valor_obj2_usd,
-                                   Cobertura_pct=cobertura))
+            # Cobertura AISLADA: valor total de Obj.2 contra el desembolso de ESTE hito.
+            # Cobertura ACUMULADA (la que importa): contra el USD total exigido hasta
+            # acá, porque los desembolsos son secuenciales y no se puede usar el mismo
+            # peso dos veces. La aislada sobreestima la cobertura real de fin de obra.
+            cobertura_hito = (valor_obj2_usd / monto_usd * 100) if pd.notna(valor_obj2_usd) else np.nan
+            cobertura_acum = (valor_obj2_usd / usd_acumulado * 100) if pd.notna(valor_obj2_usd) and usd_acumulado > 0 else np.nan
+            filas_usd.append(dict(Hito=nombre, Fecha=fila_sem["Date"], USD_Hito=monto_usd,
+                                   USD_Acumulado=usd_acumulado, Valor_Obj2_ARS=valor_obj2_ars, FX=fx,
+                                   Valor_Obj2_USD=valor_obj2_usd, Cobertura_hito_pct=cobertura_hito,
+                                   Cobertura_acum_pct=cobertura_acum))
         tabla_usd = pd.DataFrame(filas_usd)
         st.dataframe(tabla_usd, use_container_width=True, hide_index=True,
                      column_config={
                          "Fecha": st.column_config.DateColumn("Fecha (más cercana)", format="DD/MM/YYYY"),
-                         "USD_Necesario": st.column_config.NumberColumn("USD necesario", format="US$ %.0f"),
+                         "USD_Hito": st.column_config.NumberColumn("USD del hito", format="US$ %.0f"),
+                         "USD_Acumulado": st.column_config.NumberColumn("USD acumulado (hasta el hito)", format="US$ %.0f"),
                          "Valor_Obj2_ARS": st.column_config.NumberColumn("Valor Objetivo 2 (ARS)", format="$ %.0f"),
                          "FX": st.column_config.NumberColumn("A3500 en la fecha", format="%.0f"),
                          "Valor_Obj2_USD": st.column_config.NumberColumn("Valor Objetivo 2 (USD)", format="US$ %.0f"),
-                         "Cobertura_pct": st.column_config.NumberColumn("Cobertura", format="%.0f%%"),
+                         "Cobertura_hito_pct": st.column_config.NumberColumn("Cobertura del hito (aislada)", format="%.0f%%"),
+                         "Cobertura_acum_pct": st.column_config.NumberColumn("Cobertura acumulada (real)", format="%.0f%%"),
                      })
         st.caption("Convierte el valor EN PESOS de Objetivo 2 (D31M7+D30S6, ya ajustado por FX, realizado o "
-                   "proyectado según la fecha) a USD con el A3500 de esa misma fecha, y lo compara contra el "
-                   "monto en USD que exige cada hito del cronograma. Como el valor en pesos ya sube con el "
-                   "FX, el valor en USD debería mantenerse relativamente estable (esa es la esencia de la "
-                   "cobertura). ≥100% = alcanza para ese hito.")
+                   "proyectado según la fecha) a USD con el A3500 de esa misma fecha. **Cobertura del hito "
+                   "(aislada):** valor total de Obj.2 ÷ el desembolso de ESE hito — sobreestima, porque usa "
+                   "el mismo capital para todos los hitos. **Cobertura acumulada (real):** valor de Obj.2 ÷ "
+                   "el USD total exigido hasta ese hito inclusive — es la que corresponde, porque los "
+                   "desembolsos son secuenciales y el capital ya consumido no se puede reutilizar. ≥100% en "
+                   "la columna acumulada = Obj.2 alcanza para cubrir TODo lo desembolsado hasta ahí.")
 
     # ---------------------------------------------------------------------
     # TAB 4 — Brecha Cambiaria
@@ -2069,10 +2138,14 @@ with tab_metodo:
     ahora refleja la cobertura real.
 
     **Ratios de riesgo-retorno (Objetivo 1):** Sharpe y Sortino se calculan sobre retornos en pesos,
-    sin restar tasa libre de riesgo (restar una TNA nominal alta distorsiona el excess return);
-    Sortino solo penaliza la volatilidad a la baja. El Information Ratio compara el retorno activo
-    (cartera − benchmark compuesto) contra el tracking error. Se anualizan con √52 y se advierte cuando
-    hay pocas semanas de historia.
+    **restando** la tasa libre de riesgo en pesos (la TNA de la caución / money market llevada a base
+    semanal). Se resta porque los retornos ya son nominales en pesos e incorporan el drift de la
+    indexación (FX/CER): con rf = 0 el exceso de retorno quedaba inflado y el Sharpe se disparaba
+    (3-4+) al medir retorno/volatilidad de una serie con drift casi constante y volatilidad semanal
+    ínfima. Restar rf lo convierte en lo que debe ser: exceso de retorno POR ENCIMA del costo de
+    mantener pesos. Sortino usa el mismo exceso pero solo penaliza la volatilidad a la baja (semanas
+    por debajo de rf). El Information Ratio compara el retorno activo (cartera − benchmark compuesto)
+    contra el tracking error. Se anualizan con √52 y se advierte cuando hay pocas semanas de historia.
 
     **Brecha cambiaria:** Oficial (idVariable 5), Minorista (idVariable 4) y bandas de flotación
     (idVariables 1187/1188) salen de la **API pública del BCRA**. MEP y CCL salen de Alphacast (dataset
