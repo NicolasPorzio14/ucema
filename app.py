@@ -22,7 +22,11 @@ Qué hace este panel:
                          CER, ETF SHY, A3500) y propuestas de mejora atadas a
                          los 4 objetivos del mandato (preservación de capital,
                          liquidez, protección inflación, cobertura cambiaria).
-  5) METODOLOGÍA       → fuentes y supuestos.
+  5) BRECHA CAMBIARIA  → dólar Oficial/Minorista/MEP/CCL y bandas de flotación,
+                         con la brecha (MEP vs. Oficial) en el tiempo. Oficial/
+                         Minorista/Bandas vienen de la API pública del BCRA (sin
+                         API key); MEP/CCL de Alphacast.
+  6) METODOLOGÍA       → fuentes y supuestos.
 
 Fuente de mercado: Alphacast, dataset 41886 (ONs / Bonos / Soberanos — el mismo
 dataset del panel PRO de Renta Fija). Los instrumentos de money-market (caución,
@@ -43,6 +47,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import requests
 import streamlit as st
 
 try:
@@ -57,6 +62,17 @@ except Exception:
 # =====================================================================
 
 DATASET_ID = 41886  # ONs / Bonos / Soberanos — mismo dataset que el panel PRO
+
+# --- Brecha cambiaria: fuentes de datos ---
+# MEP y CCL no son series oficiales del BCRA (surgen de operar bonos/acciones en
+# distintas plazas), así que salen de Alphacast. Oficial, minorista y las bandas
+# de flotación SÍ son series oficiales del BCRA, y su API pública (sin API key)
+# las expone directamente — se usa esa en lugar de Alphacast para esas cuatro,
+# porque es la fuente primaria y no consume cupo de la cuenta de Alphacast.
+FX_DATASET_ID = 5288  # Alphacast: "Markets - Argentina - FX premiums - Daily" (Blue/MEP/CCL/Oficial/Mayorista)
+BCRA_API_BASE = "https://api.bcra.gob.ar/estadisticas/v4.0/monetarias"
+BCRA_VARS = {"usd_oficial": 5, "usd_minorista": 4, "lower_band": 1187, "upper_band": 1188}
+REGIMEN_BANDAS_INICIO = "2025-04-14"  # primera fecha con dato de banda publicada por el BCRA
 
 # Benchmarks del propio IPS (diapositiva "Medición de Desempeño"), usados en
 # la pestaña de Insights — no se inventan, son los que define el mandato.
@@ -283,6 +299,109 @@ def synthetic_dataset(tickers: list, seed: int = 8, days: int = 420) -> pd.DataF
                               Paridad=round(float(paridad[i]), 2), Volumen=np.nan,
                               Clase=clase_map.get(tk, "Otro")))
     return pd.DataFrame(rows)
+
+
+# =====================================================================
+# Brecha cambiaria — dólar oficial/minorista/bandas (BCRA, API pública sin
+# key) + MEP/CCL (Alphacast, dataset de FX premiums)
+# =====================================================================
+
+@st.cache_data(show_spinner=False, ttl=30 * 60)
+def fetch_bcra_variable(id_variable: int, desde: str, hasta: str) -> pd.DataFrame:
+    """Serie diaria de una variable del BCRA (API pública v4.0, sin autenticación).
+    Devuelve columnas Date/Valor; DataFrame vacío si la API falla o no hay datos
+    (nunca inventa un valor — un error acá se ve como un hueco en el gráfico)."""
+    try:
+        r = requests.get(f"{BCRA_API_BASE}/{id_variable}", params={"desde": desde, "hasta": hasta}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        det = data.get("results", [{}])[0].get("detalle", [])
+        if not det:
+            return pd.DataFrame(columns=["Date", "Valor"])
+        df = pd.DataFrame(det)
+        df["Date"] = pd.to_datetime(df["fecha"])
+        df["Valor"] = pd.to_numeric(df["valor"], errors="coerce")
+        return df[["Date", "Valor"]].sort_values("Date").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["Date", "Valor"])
+
+
+@st.cache_data(show_spinner=False, ttl=30 * 60)
+def fetch_bcra_fx_bundle(desde: str, hasta: str) -> tuple:
+    """Combina usd_oficial, usd_minorista, lower_band y upper_band del BCRA en
+    un solo DataFrame por fecha. Devuelve (df, variables_sin_dato)."""
+    series = {}
+    faltantes = []
+    for nombre, id_var in BCRA_VARS.items():
+        d = fetch_bcra_variable(id_var, desde, hasta)
+        if d.empty:
+            faltantes.append(nombre)
+        else:
+            series[nombre] = d.set_index("Date")["Valor"]
+    if not series:
+        return pd.DataFrame(), list(BCRA_VARS.keys())
+    out = pd.concat(series, axis=1).reset_index().rename(columns={"index": "Date"})
+    return out.sort_values("Date").reset_index(drop=True), faltantes
+
+
+def normalize_fx_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza el dataset de Alphacast de FX premiums para quedarse con MEP y
+    CCL. Los nombres de columna varían de dataset a dataset, así que se buscan
+    por palabra clave en vez de hardcodear un nombre exacto — si no encuentra
+    alguna, la deja en NaN y lo reporta (nunca inventa el dato)."""
+    df = df.copy()
+    date_col = next((c for c in df.columns if str(c).strip().lower() in ("date", "fecha")), df.columns[0])
+    df = df.rename(columns={date_col: "Date"})
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+    def find_col(keywords, exclude=()):
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if any(k in cl for k in keywords) and not any(k in cl for k in exclude):
+                return c
+        return None
+
+    col_mep = find_col(["mep", "bolsa"])
+    col_ccl = find_col(["ccl", "contadoconliqui", "contado con liqui", "contado_con_liqui"])
+
+    out = pd.DataFrame({"Date": df["Date"]})
+    out["usd_mep"] = pd.to_numeric(df[col_mep], errors="coerce") if col_mep else np.nan
+    out["usd_ccl"] = pd.to_numeric(df[col_ccl], errors="coerce") if col_ccl else np.nan
+    out = out.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    out.attrs["col_mep"] = col_mep
+    out.attrs["col_ccl"] = col_ccl
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def synthetic_fx_bundle(desde: str, hasta: str, seed: int = 8) -> pd.DataFrame:
+    """Serie sintética de oficial/minorista/MEP/CCL/bandas SOLO para el modo de
+    ejemplo — reproduce el orden de magnitud y la lógica de bandas (piso -1%/mes,
+    techo +1%/mes desde $1000-$1400 el 14/4/2025) pero no es dato real."""
+    rng = np.random.default_rng(seed)
+    fechas = pd.bdate_range(start=desde, end=hasta)
+    base = pd.Timestamp(REGIMEN_BANDAS_INICIO)
+    dias = np.array([(f - base).days for f in fechas], dtype=float)
+    meses = np.clip(dias / 30.44, 0, None)
+
+    oficial0 = 1200.0
+    oficial = oficial0 + np.cumsum(rng.normal(1.0, 4.0, len(fechas)))
+    minorista = oficial * 1.015
+    mep = oficial * (1 + np.clip(0.02 + np.cumsum(rng.normal(0, 0.0009, len(fechas))), 0.0, 0.20))
+    ccl = mep * (1 + np.abs(rng.normal(0.004, 0.004, len(fechas))))
+    upper_band = 1400.0 * (1.01 ** meses)
+    lower_band = 1000.0 * (0.99 ** meses)
+
+    return pd.DataFrame({"Date": fechas, "usd_oficial": oficial, "usd_minorista": minorista,
+                          "usd_mep": mep, "usd_ccl": ccl, "upper_band": upper_band, "lower_band": lower_band})
+
+
+def compute_brecha(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrega la columna Brecha = (MEP - Oficial) / Oficial, idéntica a la
+    fórmula de la planilla original del usuario."""
+    d = df.copy()
+    d["Brecha"] = (d["usd_mep"] - d["usd_oficial"]) / d["usd_oficial"]
+    return d
 
 
 # =====================================================================
@@ -649,310 +768,448 @@ else:
             st.error(f"No se pudo descargar/procesar el dataset: {e}")
 
 if not data_ok:
-    st.stop()
+    st.warning("⚠️ Sin datos de mercado del dataset principal (ONs/Bonos/Soberanos): las pestañas "
+               "'Cartera Hoy', 'Simulación Semanal', 'Riesgo' e 'Insights' quedan sin contenido hasta "
+               "que cargues la Alphacast API Key o actives el modo de ejemplo. La pestaña "
+               "'Brecha Cambiaria' funciona igual, porque usa la API pública del BCRA.")
+    as_of_hoy = pd.Timestamp(datetime.now().date())
+    snap_hoy = pd.DataFrame()
+    kpis_hoy = dict(tir_cartera=np.nan, md_cartera=np.nan, peso_cubierto=0.0, peso_total=0.0)
+    port_compra = pd.DataFrame()
+    semanal = pd.DataFrame()
+    valor_actual_hoy = np.nan
+    resultado_pct_hoy = np.nan
+else:
+    as_of_hoy = pd.Timestamp(fecha_datos)
+    snap_hoy = build_holdings_snapshot(port_df, df_norm, as_of_hoy)
+    kpis_hoy = portfolio_kpis(snap_hoy)
 
-as_of_hoy = pd.Timestamp(fecha_datos)
-snap_hoy = build_holdings_snapshot(port_df, df_norm, as_of_hoy)
-kpis_hoy = portfolio_kpis(snap_hoy)
+    # Compra del 29/6 y simulación semanal — se calculan UNA vez y se reusan en
+    # todas las pestañas (única fuente de verdad).
+    port_compra = compute_compra(port_df, df_norm, fecha_compra, monto_compra)
+    semanal = simulacion_semanal(port_compra, df_norm, fecha_compra, as_of_hoy, fecha_fin_sim)
 
-# Compra del 29/6 y simulación semanal — se calculan UNA vez y se reusan en
-# todas las pestañas (única fuente de verdad).
-port_compra = compute_compra(port_df, df_norm, fecha_compra, monto_compra)
-semanal = simulacion_semanal(port_compra, df_norm, fecha_compra, as_of_hoy, fecha_fin_sim)
+    fila_hoy = semanal[semanal["Estado"] == "Hoy"]
+    valor_actual_hoy = float(fila_hoy["Valor_Cartera"].iloc[0]) if not fila_hoy.empty else np.nan
+    resultado_pct_hoy = float(fila_hoy["Rendimiento_Acumulado_%"].iloc[0]) if not fila_hoy.empty else np.nan
 
-fila_hoy = semanal[semanal["Estado"] == "Hoy"]
-valor_actual_hoy = float(fila_hoy["Valor_Cartera"].iloc[0]) if not fila_hoy.empty else np.nan
-resultado_pct_hoy = float(fila_hoy["Rendimiento_Acumulado_%"].iloc[0]) if not fila_hoy.empty else np.nan
-
-tab_hoy, tab_sim, tab_riesgo, tab_insights, tab_metodo = st.tabs(
+tab_hoy, tab_sim, tab_riesgo, tab_insights, tab_brecha, tab_metodo = st.tabs(
     ["🏠 Cartera Hoy", "📊 Simulación Semanal", "⚖️ Riesgo & Límites IPS",
-     "💡 Insights & Propuestas", "ℹ️ Metodología"]
+     "💡 Insights & Propuestas", "💵 Brecha Cambiaria", "ℹ️ Metodología"]
 )
 
 # ---------------------------------------------------------------------
 # TAB 1 — Cartera Hoy
 # ---------------------------------------------------------------------
 with tab_hoy:
-    no_encontrados = snap_hoy.loc[~snap_hoy["Encontrado"], "Ticker"].tolist()
-    if no_encontrados:
-        st.info(f"Sin dato de mercado para: **{', '.join(no_encontrados)}**. No se incluyen en la TIR/Duration "
-                f"ponderada ni en la simulación de compra hasta que tengan cotización en el dataset.")
+    if not data_ok:
+        st.info("Cargá datos de mercado (Alphacast real o modo de ejemplo) para ver esta pestaña.")
+    else:
+        no_encontrados = snap_hoy.loc[~snap_hoy["Encontrado"], "Ticker"].tolist()
+        if no_encontrados:
+            st.info(f"Sin dato de mercado para: **{', '.join(no_encontrados)}**. No se incluyen en la TIR/Duration "
+                    f"ponderada ni en la simulación de compra hasta que tengan cotización en el dataset.")
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("TIR ponderada de la cartera", f"{kpis_hoy['tir_cartera']:.2f}%" if pd.notna(kpis_hoy['tir_cartera']) else "—")
-    k2.metric("Duration (MD) ponderada", f"{kpis_hoy['md_cartera']:.2f} años" if pd.notna(kpis_hoy['md_cartera']) else "—")
-    k3.metric("Monto invertido (29/6)", fmt_ars(monto_compra))
-    k4.metric("Valor actual (hoy)", fmt_ars(valor_actual_hoy),
-              f"{resultado_pct_hoy:+.2f}% desde la compra" if pd.notna(resultado_pct_hoy) else None)
-    st.caption(f"Snapshot al {as_of_hoy.strftime('%d/%m/%Y')}" + (" (datos de ejemplo)" if modo_demo else "") +
-               f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')}")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("TIR ponderada de la cartera", f"{kpis_hoy['tir_cartera']:.2f}%" if pd.notna(kpis_hoy['tir_cartera']) else "—")
+        k2.metric("Duration (MD) ponderada", f"{kpis_hoy['md_cartera']:.2f} años" if pd.notna(kpis_hoy['md_cartera']) else "—")
+        k3.metric("Monto invertido (29/6)", fmt_ars(monto_compra))
+        k4.metric("Valor actual (hoy)", fmt_ars(valor_actual_hoy),
+                  f"{resultado_pct_hoy:+.2f}% desde la compra" if pd.notna(resultado_pct_hoy) else None)
+        st.caption(f"Snapshot al {as_of_hoy.strftime('%d/%m/%Y')}" + (" (datos de ejemplo)" if modo_demo else "") +
+                   f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')}")
 
-    st.divider()
-    p1, p2, p3 = st.columns(3)
+        st.divider()
+        p1, p2, p3 = st.columns(3)
 
-    with p1:
-        g = snap_hoy.groupby("Objetivo")["Peso_pct"].sum().reset_index()
-        fig = px.pie(g, names="Objetivo", values="Peso_pct", hole=0.45,
-                     color="Objetivo", color_discrete_map={
-                         "1 · Capital de Trabajo": COLORS["obj1"], "2 · Cobertura FX Préstamo": COLORS["obj2"]})
-        fig.update_traces(textinfo="label+percent", textposition="outside",
-                           textfont=dict(color="white", size=12),
-                           outsidetextfont=dict(color="white", size=12))
-        fig.update_layout(title="Por Objetivo", showlegend=False, height=380, **PLOTLY_LAYOUT)
-        fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
-        st.plotly_chart(fig, use_container_width=True)
+        with p1:
+            g = snap_hoy.groupby("Objetivo")["Peso_pct"].sum().reset_index()
+            fig = px.pie(g, names="Objetivo", values="Peso_pct", hole=0.45,
+                         color="Objetivo", color_discrete_map={
+                             "1 · Capital de Trabajo": COLORS["obj1"], "2 · Cobertura FX Préstamo": COLORS["obj2"]})
+            fig.update_traces(textinfo="label+percent", textposition="outside",
+                               textfont=dict(color="white", size=12),
+                               outsidetextfont=dict(color="white", size=12))
+            fig.update_layout(title="Por Objetivo", showlegend=False, height=380, **PLOTLY_LAYOUT)
+            fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
+            st.plotly_chart(fig, use_container_width=True)
 
-    with p2:
-        g = snap_hoy.groupby("Tramo")["Peso_pct"].sum().reset_index()
-        fig = px.pie(g, names="Tramo", values="Peso_pct", hole=0.45)
-        fig.update_traces(textinfo="label+percent", textposition="outside",
-                           marker=dict(colors=px.colors.qualitative.Safe),
-                           textfont=dict(color="white", size=12),
-                           outsidetextfont=dict(color="white", size=12))
-        fig.update_layout(title="Por Tramo", showlegend=False, height=380, **PLOTLY_LAYOUT)
-        fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
-        st.plotly_chart(fig, use_container_width=True)
+        with p2:
+            g = snap_hoy.groupby("Tramo")["Peso_pct"].sum().reset_index()
+            fig = px.pie(g, names="Tramo", values="Peso_pct", hole=0.45)
+            fig.update_traces(textinfo="label+percent", textposition="outside",
+                               marker=dict(colors=px.colors.qualitative.Safe),
+                               textfont=dict(color="white", size=12),
+                               outsidetextfont=dict(color="white", size=12))
+            fig.update_layout(title="Por Tramo", showlegend=False, height=380, **PLOTLY_LAYOUT)
+            fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
+            st.plotly_chart(fig, use_container_width=True)
 
-    with p3:
-        g = snap_hoy.groupby("Ticker")["Peso_pct"].sum().reset_index()
-        fig = px.pie(g, names="Ticker", values="Peso_pct", hole=0.45)
-        fig.update_traces(textinfo="label+percent", textposition="outside",
-                           marker=dict(colors=px.colors.qualitative.Set2),
-                           textfont=dict(color="white", size=12),
-                           outsidetextfont=dict(color="white", size=12))
-        fig.update_layout(title="Por Instrumento", showlegend=False, height=380, **PLOTLY_LAYOUT)
-        fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
-        st.plotly_chart(fig, use_container_width=True)
+        with p3:
+            g = snap_hoy.groupby("Ticker")["Peso_pct"].sum().reset_index()
+            fig = px.pie(g, names="Ticker", values="Peso_pct", hole=0.45)
+            fig.update_traces(textinfo="label+percent", textposition="outside",
+                               marker=dict(colors=px.colors.qualitative.Set2),
+                               textfont=dict(color="white", size=12),
+                               outsidetextfont=dict(color="white", size=12))
+            fig.update_layout(title="Por Instrumento", showlegend=False, height=380, **PLOTLY_LAYOUT)
+            fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-    st.subheader("Detalle de holdings — compra vs. hoy")
-    detalle = snap_hoy.merge(
-        port_compra[["Ticker", "Monto_Invertido", "Precio_Compra", "VN_Comprado"]], on="Ticker", how="left")
-    detalle["Valor_Actual"] = np.where(
-        detalle["Es_Cash"],
-        detalle["Monto_Invertido"] * (1 + detalle["TNA_Manual_pct"] / 100.0) ** ((as_of_hoy - fecha_compra).days / 365.0),
-        detalle["VN_Comprado"] * detalle["Paridad"] / 100.0,
-    )
-    detalle["Resultado_%"] = (detalle["Valor_Actual"] / detalle["Monto_Invertido"] - 1) * 100
-    cols_show = ["Ticker", "Descripcion", "Objetivo", "Peso_pct", "Clase", "TIR", "MD",
-                 "Monto_Invertido", "Precio_Compra", "VN_Comprado", "Valor_Actual", "Resultado_%"]
-    tabla = detalle[[c for c in cols_show if c in detalle.columns]].copy()
-    st.dataframe(tabla.sort_values("Peso_pct", ascending=False), use_container_width=True, height=300,
-                 column_config={
-                     "Monto_Invertido": st.column_config.NumberColumn("Monto invertido", format="$ %.0f"),
-                     "Valor_Actual": st.column_config.NumberColumn("Valor actual", format="$ %.0f"),
-                     "Resultado_%": st.column_config.NumberColumn("Resultado (%)", format="%.2f%%"),
-                 })
+        st.divider()
+        st.subheader("Detalle de holdings — compra vs. hoy")
+        detalle = snap_hoy.merge(
+            port_compra[["Ticker", "Monto_Invertido", "Precio_Compra", "VN_Comprado"]], on="Ticker", how="left")
+        detalle["Valor_Actual"] = np.where(
+            detalle["Es_Cash"],
+            detalle["Monto_Invertido"] * (1 + detalle["TNA_Manual_pct"] / 100.0) ** ((as_of_hoy - fecha_compra).days / 365.0),
+            detalle["VN_Comprado"] * detalle["Paridad"] / 100.0,
+        )
+        detalle["Resultado_%"] = (detalle["Valor_Actual"] / detalle["Monto_Invertido"] - 1) * 100
+        cols_show = ["Ticker", "Descripcion", "Objetivo", "Peso_pct", "Clase", "TIR", "MD",
+                     "Monto_Invertido", "Precio_Compra", "VN_Comprado", "Valor_Actual", "Resultado_%"]
+        tabla = detalle[[c for c in cols_show if c in detalle.columns]].copy()
+        st.dataframe(tabla.sort_values("Peso_pct", ascending=False), use_container_width=True, height=300,
+                     column_config={
+                         "Monto_Invertido": st.column_config.NumberColumn("Monto invertido", format="$ %.0f"),
+                         "Valor_Actual": st.column_config.NumberColumn("Valor actual", format="$ %.0f"),
+                         "Resultado_%": st.column_config.NumberColumn("Resultado (%)", format="%.2f%%"),
+                     })
 
-    csv = tabla.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar tabla (CSV)", data=csv,
-                        file_name=f"cartera_grupo8_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
+        csv = tabla.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar tabla (CSV)", data=csv,
+                            file_name=f"cartera_grupo8_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
 
-# ---------------------------------------------------------------------
-# TAB 2 — Simulación Semanal
-# ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # TAB 2 — Simulación Semanal
+    # ---------------------------------------------------------------------
 with tab_sim:
-    st.markdown("### 📊 Simulación: compra el 29/6/2026 y seguimiento semanal")
-    st.caption("Se compran los 8 instrumentos el día de la compra con el monto asignado, a precio de "
-               "mercado de ese día. De ahí en más los NOMINALES quedan fijos (sin rebalanceo): lo que "
-               "cambia cada lunes es el precio. Tramo sólido = precio real de mercado. Tramo punteado = "
-               "proyección por devengamiento a la TIR vigente hoy (no es una predicción de precios).")
+    if not data_ok:
+        st.info("Cargá datos de mercado (Alphacast real o modo de ejemplo) para ver esta pestaña.")
+    else:
+        st.markdown("### 📊 Simulación: compra el 29/6/2026 y seguimiento semanal")
+        st.caption("Se compran los 8 instrumentos el día de la compra con el monto asignado, a precio de "
+                   "mercado de ese día. De ahí en más los NOMINALES quedan fijos (sin rebalanceo): lo que "
+                   "cambia cada lunes es el precio. Tramo sólido = precio real de mercado. Tramo punteado = "
+                   "proyección por devengamiento a la TIR vigente hoy (no es una predicción de precios).")
 
-    cols_compra = ["Ticker", "Descripcion", "Peso_pct", "Monto_Invertido", "Precio_Compra", "VN_Comprado"]
-    st.dataframe(port_compra[cols_compra].rename(columns={"Peso_pct": "Peso (%)"}),
-                 use_container_width=True, hide_index=True, height=300,
-                 column_config={
-                     "Monto_Invertido": st.column_config.NumberColumn("Monto invertido", format="$ %.0f"),
-                     "Precio_Compra": st.column_config.NumberColumn("Precio de compra (Paridad)", format="%.2f"),
-                     "VN_Comprado": st.column_config.NumberColumn("VN comprado", format="%.0f"),
-                 })
-    sin_precio = port_compra.loc[port_compra["VN_Comprado"].isna(), "Ticker"].tolist()
-    if sin_precio:
-        st.warning(f"Sin precio de mercado en la fecha de compra para: **{', '.join(sin_precio)}** — "
-                   f"no se pueden calcular sus nominales y quedan afuera de la simulación.")
+        cols_compra = ["Ticker", "Descripcion", "Peso_pct", "Monto_Invertido", "Precio_Compra", "VN_Comprado"]
+        st.dataframe(port_compra[cols_compra].rename(columns={"Peso_pct": "Peso (%)"}),
+                     use_container_width=True, hide_index=True, height=300,
+                     column_config={
+                         "Monto_Invertido": st.column_config.NumberColumn("Monto invertido", format="$ %.0f"),
+                         "Precio_Compra": st.column_config.NumberColumn("Precio de compra (Paridad)", format="%.2f"),
+                         "VN_Comprado": st.column_config.NumberColumn("VN comprado", format="%.0f"),
+                     })
+        sin_precio = port_compra.loc[port_compra["VN_Comprado"].isna(), "Ticker"].tolist()
+        if sin_precio:
+            st.warning(f"Sin precio de mercado en la fecha de compra para: **{', '.join(sin_precio)}** — "
+                       f"no se pueden calcular sus nominales y quedan afuera de la simulación.")
 
-    st.divider()
-    realizado = semanal[semanal["Estado"].isin(["Compra", "Hoy", "Realizado"])].sort_values("Date")
-    proyectado = semanal[semanal["Estado"].isin(["Hoy", "Proyectado"])].sort_values("Date")
+        st.divider()
+        realizado = semanal[semanal["Estado"].isin(["Compra", "Hoy", "Realizado"])].sort_values("Date")
+        proyectado = semanal[semanal["Estado"].isin(["Hoy", "Proyectado"])].sort_values("Date")
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=realizado["Date"], y=realizado["Valor_Cartera"], mode="lines+markers",
-                              line=dict(width=2.6, color=COLORS["primary"]), name="Realizado"))
-    fig.add_trace(go.Scatter(x=proyectado["Date"], y=proyectado["Valor_Cartera"], mode="lines+markers",
-                              line=dict(width=2.2, color=COLORS["primary"], dash="dot"), name="Proyectado"))
-    fig.add_vline(x=as_of_hoy, line_dash="dash", line_color=COLORS["accent"],
-                  annotation_text="Hoy", annotation_font_color=COLORS["accent"])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=realizado["Date"], y=realizado["Valor_Cartera"], mode="lines+markers",
+                                  line=dict(width=2.6, color=COLORS["primary"]), name="Realizado"))
+        fig.add_trace(go.Scatter(x=proyectado["Date"], y=proyectado["Valor_Cartera"], mode="lines+markers",
+                                  line=dict(width=2.2, color=COLORS["primary"], dash="dot"), name="Proyectado"))
+        fig.add_vline(x=as_of_hoy, line_dash="dash", line_color=COLORS["accent"],
+                      annotation_text="Hoy", annotation_font_color=COLORS["accent"])
 
-    fecha_desembolso_ts = pd.Timestamp(fecha_desembolso)
-    hitos = {"Mes 3 (20% obra civil)": fecha_desembolso_ts + pd.Timedelta(days=90),
-             "Mes 6 (30% obra civil)": fecha_desembolso_ts + pd.Timedelta(days=180),
-             "Mes 9 (50% + maquinaria)": fecha_desembolso_ts + pd.Timedelta(days=270)}
-    for nombre, fecha_hito in hitos.items():
-        if semanal["Date"].min() <= fecha_hito <= semanal["Date"].max():
-            fig.add_vline(x=fecha_hito, line_dash="dot", line_color=COLORS["obj2"],
-                          annotation_text=nombre, annotation_font_size=9, annotation_font_color=COLORS["obj2"])
+        fecha_desembolso_ts = pd.Timestamp(fecha_desembolso)
+        hitos = {"Mes 3 (20% obra civil)": fecha_desembolso_ts + pd.Timedelta(days=90),
+                 "Mes 6 (30% obra civil)": fecha_desembolso_ts + pd.Timedelta(days=180),
+                 "Mes 9 (50% + maquinaria)": fecha_desembolso_ts + pd.Timedelta(days=270)}
+        for nombre, fecha_hito in hitos.items():
+            if semanal["Date"].min() <= fecha_hito <= semanal["Date"].max():
+                fig.add_vline(x=fecha_hito, line_dash="dot", line_color=COLORS["obj2"],
+                              annotation_text=nombre, annotation_font_size=9, annotation_font_color=COLORS["obj2"])
 
-    fig.update_layout(title="Valor de la cartera cada lunes (nominales fijos desde la compra)",
-                       height=440, **PLOTLY_LAYOUT)
-    style_axes(fig, "Fecha", "Valor de la cartera (ARS)")
-    watermark(fig, as_of_hoy, "Alphacast" if not modo_demo else "Ejemplo")
-    st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(title="Valor de la cartera cada lunes (nominales fijos desde la compra)",
+                           height=440, **PLOTLY_LAYOUT)
+        style_axes(fig, "Fecha", "Valor de la cartera (ARS)")
+        watermark(fig, as_of_hoy, "Alphacast" if not modo_demo else "Ejemplo")
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig2 = px.bar(semanal.iloc[1:], x="Date", y="Rendimiento_Semanal_%",
-                  color=semanal.iloc[1:]["Rendimiento_Semanal_%"] >= 0,
-                  color_discrete_map={True: COLORS["ok"], False: COLORS["warn"]})
-    fig2.add_vline(x=as_of_hoy, line_dash="dash", line_color=COLORS["accent"])
-    fig2.update_layout(title="Rendimiento semanal de la cartera (%)", height=340, **PLOTLY_LAYOUT, showlegend=False)
-    style_axes(fig2, "Fecha", "Rendimiento semanal (%)")
-    st.plotly_chart(fig2, use_container_width=True)
+        fig2 = px.bar(semanal.iloc[1:], x="Date", y="Rendimiento_Semanal_%",
+                      color=semanal.iloc[1:]["Rendimiento_Semanal_%"] >= 0,
+                      color_discrete_map={True: COLORS["ok"], False: COLORS["warn"]})
+        fig2.add_vline(x=as_of_hoy, line_dash="dash", line_color=COLORS["accent"])
+        fig2.update_layout(title="Rendimiento semanal de la cartera (%)", height=340, **PLOTLY_LAYOUT, showlegend=False)
+        style_axes(fig2, "Fecha", "Rendimiento semanal (%)")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("Tabla semanal completa")
-    tabla_sem = semanal[["Date", "Estado", "Valor_Cartera", "Peso_Cubierto_pct",
-                          "Rendimiento_Semanal_%", "Rendimiento_Acumulado_%"]].copy()
-    st.dataframe(tabla_sem, use_container_width=True, height=320,
-                 column_config={
-                     "Valor_Cartera": st.column_config.NumberColumn("Valor de la cartera", format="$ %.0f"),
-                     "Peso_Cubierto_pct": st.column_config.NumberColumn("Peso con dato (%)", format="%.1f%%"),
-                     "Rendimiento_Semanal_%": st.column_config.NumberColumn("Rend. semanal", format="%.2f%%"),
-                     "Rendimiento_Acumulado_%": st.column_config.NumberColumn("Rend. acumulado", format="%.2f%%"),
-                 })
-    csv_sem = tabla_sem.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar simulación semanal (CSV)", data=csv_sem,
-                        file_name=f"simulacion_semanal_grupo8_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
+        st.subheader("Tabla semanal completa")
+        tabla_sem = semanal[["Date", "Estado", "Valor_Cartera", "Peso_Cubierto_pct",
+                              "Rendimiento_Semanal_%", "Rendimiento_Acumulado_%"]].copy()
+        st.dataframe(tabla_sem, use_container_width=True, height=320,
+                     column_config={
+                         "Valor_Cartera": st.column_config.NumberColumn("Valor de la cartera", format="$ %.0f"),
+                         "Peso_Cubierto_pct": st.column_config.NumberColumn("Peso con dato (%)", format="%.1f%%"),
+                         "Rendimiento_Semanal_%": st.column_config.NumberColumn("Rend. semanal", format="%.2f%%"),
+                         "Rendimiento_Acumulado_%": st.column_config.NumberColumn("Rend. acumulado", format="%.2f%%"),
+                     })
+        csv_sem = tabla_sem.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar simulación semanal (CSV)", data=csv_sem,
+                            file_name=f"simulacion_semanal_grupo8_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
 
-# ---------------------------------------------------------------------
-# TAB 3 — Riesgo & Límites IPS
-# ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # TAB 3 — Riesgo & Límites IPS
+    # ---------------------------------------------------------------------
 with tab_riesgo:
-    st.markdown("### ⚖️ Chequeo de límites del IPS")
+    if not data_ok:
+        st.info("Cargá datos de mercado (Alphacast real o modo de ejemplo) para ver esta pestaña.")
+    else:
+        st.markdown("### ⚖️ Chequeo de límites del IPS")
 
-    md_ok = pd.notna(kpis_hoy["md_cartera"]) and md_target_lo <= kpis_hoy["md_cartera"] <= md_target_hi
-    st.markdown(f"""
-    **1) Duration dentro de la banda objetivo ({md_target_lo:.2f} – {md_target_hi:.2f} años):**
-    {"✅ Cumple" if md_ok else "🔴 Fuera de banda"} — actual **{kpis_hoy['md_cartera']:.2f} años**
-    """ if pd.notna(kpis_hoy["md_cartera"]) else "**1) Duration:** sin datos suficientes.")
+        md_ok = pd.notna(kpis_hoy["md_cartera"]) and md_target_lo <= kpis_hoy["md_cartera"] <= md_target_hi
+        st.markdown(f"""
+        **1) Duration dentro de la banda objetivo ({md_target_lo:.2f} – {md_target_hi:.2f} años):**
+        {"✅ Cumple" if md_ok else "🔴 Fuera de banda"} — actual **{kpis_hoy['md_cartera']:.2f} años**
+        """ if pd.notna(kpis_hoy["md_cartera"]) else "**1) Duration:** sin datos suficientes.")
 
-    st.divider()
-    st.markdown(f"**2) Concentración máxima por ON corporativa individual (límite {limite_emisor_corp:.2f}%):**")
-    corp = snap_hoy[snap_hoy["Segmento"] == "Corporate"].copy()
-    if not corp.empty:
-        corp["Cumple"] = corp["Peso_pct"] <= limite_emisor_corp
-        corp_show = corp[["Ticker", "Descripcion", "Peso_pct", "Cumple"]].sort_values("Peso_pct", ascending=False)
-        st.dataframe(corp_show, use_container_width=True, height=160)
-        incumplen = corp_show.loc[~corp_show["Cumple"], "Ticker"].tolist()
-        if incumplen:
-            st.error(f"🔴 Exceden el límite individual: **{', '.join(incumplen)}**. Rebalancear o "
-                      f"diversificar en más emisores.")
+        st.divider()
+        st.markdown(f"**2) Concentración máxima por ON corporativa individual (límite {limite_emisor_corp:.2f}%):**")
+        corp = snap_hoy[snap_hoy["Segmento"] == "Corporate"].copy()
+        if not corp.empty:
+            corp["Cumple"] = corp["Peso_pct"] <= limite_emisor_corp
+            corp_show = corp[["Ticker", "Descripcion", "Peso_pct", "Cumple"]].sort_values("Peso_pct", ascending=False)
+            st.dataframe(corp_show, use_container_width=True, height=160)
+            incumplen = corp_show.loc[~corp_show["Cumple"], "Ticker"].tolist()
+            if incumplen:
+                st.error(f"🔴 Exceden el límite individual: **{', '.join(incumplen)}**. Rebalancear o "
+                          f"diversificar en más emisores.")
+            else:
+                st.success("✅ Ninguna ON corporativa individual excede el límite.")
         else:
-            st.success("✅ Ninguna ON corporativa individual excede el límite.")
-    else:
-        st.info("No hay holdings marcados como Segmento = Corporate en la cartera actual.")
+            st.info("No hay holdings marcados como Segmento = Corporate en la cartera actual.")
 
-    st.divider()
-    st.markdown(f"**3) Sublímite Dollar-Linked sobre el total de la cartera (referencia IPS: {sublimite_dl:.0f}%):**")
-    peso_total_cartera = snap_hoy["Peso_pct"].sum()
-    peso_dl = snap_hoy.loc[snap_hoy["Clase"] == "DL", "Peso_pct"].sum()
-    if peso_total_cartera > 0:
-        pct_dl = peso_dl / peso_total_cartera * 100
-        st.metric("% Dollar-Linked sobre el total de la cartera", f"{pct_dl:.1f}%",
-                  f"{pct_dl - sublimite_dl:+.1f} pp vs. referencia")
-        st.caption("Todo instrumento clasificado DL (D31M7 y D30S6 por defecto) es la cobertura cambiaria "
-                    "del préstamo — por diseño del IPS, este ratio debería dar ≈86% de la cartera total.")
-    else:
-        st.info("No hay holdings cargados para calcular este ratio.")
+        st.divider()
+        st.markdown(f"**3) Sublímite Dollar-Linked sobre el total de la cartera (referencia IPS: {sublimite_dl:.0f}%):**")
+        peso_total_cartera = snap_hoy["Peso_pct"].sum()
+        peso_dl = snap_hoy.loc[snap_hoy["Clase"] == "DL", "Peso_pct"].sum()
+        if peso_total_cartera > 0:
+            pct_dl = peso_dl / peso_total_cartera * 100
+            st.metric("% Dollar-Linked sobre el total de la cartera", f"{pct_dl:.1f}%",
+                      f"{pct_dl - sublimite_dl:+.1f} pp vs. referencia")
+            st.caption("Todo instrumento clasificado DL (D31M7 y D30S6 por defecto) es la cobertura cambiaria "
+                        "del préstamo — por diseño del IPS, este ratio debería dar ≈86% de la cartera total.")
+        else:
+            st.info("No hay holdings cargados para calcular este ratio.")
 
-    st.divider()
-    st.markdown("""
-    **4) Otros lineamientos del IPS (chequeo cualitativo):**
-    - ✅ Cero exposición a renta variable, cripto o derivados especulativos (por construcción de esta cartera de renta fija).
-    - ✅ Sin compra de dólar oficial/MEP — la cobertura FX se instrumenta vía instrumentos Dollar-Linked.
-    - 🔁 Rebalanceo mensual recomendado por desvío de tramo y liquidez mínima del Tramo Operativo.
-    """)
+        st.divider()
+        st.markdown("""
+        **4) Otros lineamientos del IPS (chequeo cualitativo):**
+        - ✅ Cero exposición a renta variable, cripto o derivados especulativos (por construcción de esta cartera de renta fija).
+        - ✅ Sin compra de dólar oficial/MEP — la cobertura FX se instrumenta vía instrumentos Dollar-Linked.
+        - 🔁 Rebalanceo mensual recomendado por desvío de tramo y liquidez mínima del Tramo Operativo.
+        """)
 
-# ---------------------------------------------------------------------
-# TAB 4 — Insights & Propuestas de Mejora
-# ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # TAB 4 — Insights & Propuestas de Mejora
+    # ---------------------------------------------------------------------
 with tab_insights:
-    st.markdown("### 💡 Performance vs. benchmarks del IPS")
-    st.caption("Los benchmarks son los que define el propio IPS (diapositiva 'Medición de Desempeño'): "
-               "no se inventan referencias externas.")
+    if not data_ok:
+        st.info("Cargá datos de mercado (Alphacast real o modo de ejemplo) para ver esta pestaña.")
+    else:
+        st.markdown("### 💡 Performance vs. benchmarks del IPS")
+        st.caption("Los benchmarks son los que define el propio IPS (diapositiva 'Medición de Desempeño'): "
+                   "no se inventan referencias externas.")
 
-    tramo12_tickers = ["CAUCION", "S31L6", "TZXD6"]
-    tramo3_tickers = ["TLCQO", "LOC5O", "AO27"]
-    obj2_tickers = ["D31M7", "D30S6"]
+        tramo12_tickers = ["CAUCION", "S31L6", "TZXD6"]
+        tramo3_tickers = ["TLCQO", "LOC5O", "AO27"]
+        obj2_tickers = ["D31M7", "D30S6"]
 
-    tir_t12 = tir_ponderada(snap_hoy, tramo12_tickers)
-    tir_t3 = tir_ponderada(snap_hoy, tramo3_tickers)
-    tir_obj2 = tir_ponderada(snap_hoy, obj2_tickers)
+        tir_t12 = tir_ponderada(snap_hoy, tramo12_tickers)
+        tir_t3 = tir_ponderada(snap_hoy, tramo3_tickers)
+        tir_obj2 = tir_ponderada(snap_hoy, obj2_tickers)
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        ok12 = pd.notna(tir_t12) and BENCHMARK_TRAMO12_LO <= tir_t12 <= BENCHMARK_TRAMO12_HI
-        st.metric("Capital de Trabajo (Tramo 1/2) — TAMAR/CER 18-22%",
-                  f"{tir_t12:.1f}%" if pd.notna(tir_t12) else "—",
-                  "✅ dentro de banda" if ok12 else "⚠️ fuera de banda")
-    with b2:
-        ok3 = pd.notna(tir_t3) and BENCHMARK_TRAMO3_LO <= tir_t3 <= BENCHMARK_TRAMO3_HI
-        st.metric("Capital de Trabajo (Tramo 3) — ETF SHY ≈3,6-3,9%",
-                  f"{tir_t3:.1f}%" if pd.notna(tir_t3) else "—",
-                  "✅ dentro de banda" if ok3 else "⚠️ fuera de banda")
-    with b3:
-        st.metric("Cobertura FX (Objetivo 2) — A3500 ≈20% (devaluación)",
-                  f"{tir_obj2:.1f}% spread propio" if pd.notna(tir_obj2) else "—",
-                  "El retorno esperado en pesos ≈ devaluación (A3500) + este spread")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            ok12 = pd.notna(tir_t12) and BENCHMARK_TRAMO12_LO <= tir_t12 <= BENCHMARK_TRAMO12_HI
+            st.metric("Capital de Trabajo (Tramo 1/2) — TAMAR/CER 18-22%",
+                      f"{tir_t12:.1f}%" if pd.notna(tir_t12) else "—",
+                      "✅ dentro de banda" if ok12 else "⚠️ fuera de banda")
+        with b2:
+            ok3 = pd.notna(tir_t3) and BENCHMARK_TRAMO3_LO <= tir_t3 <= BENCHMARK_TRAMO3_HI
+            st.metric("Capital de Trabajo (Tramo 3) — ETF SHY ≈3,6-3,9%",
+                      f"{tir_t3:.1f}%" if pd.notna(tir_t3) else "—",
+                      "✅ dentro de banda" if ok3 else "⚠️ fuera de banda")
+        with b3:
+            st.metric("Cobertura FX (Objetivo 2) — A3500 ≈20% (devaluación)",
+                      f"{tir_obj2:.1f}% spread propio" if pd.notna(tir_obj2) else "—",
+                      "El retorno esperado en pesos ≈ devaluación (A3500) + este spread")
 
-    st.divider()
-    st.markdown("### 🎯 Estado por objetivo del mandato")
+        st.divider()
+        st.markdown("### 🎯 Estado por objetivo del mandato")
 
-    resultado_txt = f"{resultado_pct_hoy:+.2f}%" if pd.notna(resultado_pct_hoy) else "—"
-    cap_ok = pd.notna(resultado_pct_hoy) and resultado_pct_hoy >= 0
-    st.markdown(f"""
-1. **Preservación de capital** (cero tolerancia a pérdida nominal): resultado acumulado desde la
-   compra = **{resultado_txt}**. {"✅ En línea con el mandato." if cap_ok else "⚠️ Resultado nominal negativo — revisar si es un movimiento transitorio de precio (bonos que pagan a la par al vencimiento) o una señal de rebalanceo."}
-2. **Liquidez** (disponibilidad calzada a pagos): Tramo Operativo (Caución + S31L6) pesa
-   **{snap_hoy.loc[snap_hoy["Ticker"].isin(["CAUCION","S31L6"]), "Peso_pct"].sum():.1f}%** de la cartera.
-3. **Protección inflación**: el tramo CER (TZXD6) pesa **{snap_hoy.loc[snap_hoy["Ticker"]=="TZXD6","Peso_pct"].sum():.1f}%**
-   de la cartera — es la única cobertura directa contra IPC; el resto de Objetivo 1 (Cauciones/S31L6/Tramo 3) está
-   en tasa nominal o dólares, no indexado a inflación.
-4. **Cobertura cambiaria** (sin comprar dólar oficial): Dollar-Linked = **{pct_dl:.1f}%** de la cartera vs.
-   préstamo de $150M / cartera de {fmt_ars(monto_compra)} ≈ {150e6/monto_compra*100:.1f}% necesario — {"✅ calce adecuado." if abs(pct_dl - 150e6/monto_compra*100) < 5 else "⚠️ revisar calce."}
-    """)
+        resultado_txt = f"{resultado_pct_hoy:+.2f}%" if pd.notna(resultado_pct_hoy) else "—"
+        cap_ok = pd.notna(resultado_pct_hoy) and resultado_pct_hoy >= 0
+        st.markdown(f"""
+    1. **Preservación de capital** (cero tolerancia a pérdida nominal): resultado acumulado desde la
+       compra = **{resultado_txt}**. {"✅ En línea con el mandato." if cap_ok else "⚠️ Resultado nominal negativo — revisar si es un movimiento transitorio de precio (bonos que pagan a la par al vencimiento) o una señal de rebalanceo."}
+    2. **Liquidez** (disponibilidad calzada a pagos): Tramo Operativo (Caución + S31L6) pesa
+       **{snap_hoy.loc[snap_hoy["Ticker"].isin(["CAUCION","S31L6"]), "Peso_pct"].sum():.1f}%** de la cartera.
+    3. **Protección inflación**: el tramo CER (TZXD6) pesa **{snap_hoy.loc[snap_hoy["Ticker"]=="TZXD6","Peso_pct"].sum():.1f}%**
+       de la cartera — es la única cobertura directa contra IPC; el resto de Objetivo 1 (Cauciones/S31L6/Tramo 3) está
+       en tasa nominal o dólares, no indexado a inflación.
+    4. **Cobertura cambiaria** (sin comprar dólar oficial): Dollar-Linked = **{pct_dl:.1f}%** de la cartera vs.
+       préstamo de $150M / cartera de {fmt_ars(monto_compra)} ≈ {150e6/monto_compra*100:.1f}% necesario — {"✅ calce adecuado." if abs(pct_dl - 150e6/monto_compra*100) < 5 else "⚠️ revisar calce."}
+        """)
 
-    st.divider()
-    st.markdown("### 📌 Propuestas de mejora")
-    bullets = []
+        st.divider()
+        st.markdown("### 📌 Propuestas de mejora")
+        bullets = []
 
-    if not cap_ok:
-        bullets.append("**Preservación de capital:** el resultado nominal acumulado es negativo. Si el driver es "
-                        "la Paridad de D31M7/D30S6 (que pagan a la par al vencimiento), no requiere acción — pero "
-                        "conviene documentarlo para el comité, porque el IPS declara *cero tolerancia* a pérdida nominal.")
-    if pd.notna(kpis_hoy["md_cartera"]) and not md_ok:
-        bullets.append(f"**Duration fuera de banda** ({kpis_hoy['md_cartera']:.2f} años vs. "
-                        f"{md_target_lo:.2f}-{md_target_hi:.2f}): rebalancear entre Tramo 2 (TZXD6) y Tramo 3 "
-                        f"para volver a la banda objetivo.")
-    if pd.notna(tir_t12) and not ok12:
-        direccion = "por debajo" if tir_t12 < BENCHMARK_TRAMO12_LO else "por encima"
-        bullets.append(f"**Tramo 1/2 rinde {direccion} del benchmark TAMAR/CER** ({tir_t12:.1f}% vs. 18-22%): "
-                        f"evaluar rotar Cauciones/S31L6/TZXD6 hacia instrumentos con mejor tasa dentro del mismo "
-                        f"horizonte (≤12 meses), sin resignar liquidez del Tramo Operativo.")
-    if pd.notna(tir_t3) and not ok3:
-        bullets.append(f"**Tramo 3 (Hard-Dollar) rinde distinto del benchmark SHY** ({tir_t3:.1f}% vs. 3,6-3,9%): "
-                        f"con solo 3 papeles y 4,2% del total, hay margen para sumar 1-2 ONs investment-grade "
-                        f"adicionales (sin superar el {limite_emisor_corp:.2f}% por emisor) y capturar mejor spread.")
-    bullets.append("**Calce de vencimientos:** D31M7 (~mar-2027) y D30S6 (~sep-2026) cubren el horizonte del "
-                    "préstamo, pero conviene escalonarlos exactamente contra los hitos de Mes 3/6/9 de desembolso "
-                    "de obra civil y maquinaria, para minimizar el riesgo de tener que vender un DL antes de "
-                    "vencimiento si el pago cae entre medio de dos vencimientos.")
-    bullets.append("**Diversificación del Tramo 3:** hoy son solo 3 instrumentos con pesos individuales muy chicos "
-                    "(1,05%-2,1%). Está lejos del límite de concentración (holgura), pero también lejos de "
-                    "aprovechar todo el presupuesto de riesgo permitido — se puede sumar diversificación sin "
-                    "tocar el perfil de riesgo agregado de la cartera.")
+        if not cap_ok:
+            bullets.append("**Preservación de capital:** el resultado nominal acumulado es negativo. Si el driver es "
+                            "la Paridad de D31M7/D30S6 (que pagan a la par al vencimiento), no requiere acción — pero "
+                            "conviene documentarlo para el comité, porque el IPS declara *cero tolerancia* a pérdida nominal.")
+        if pd.notna(kpis_hoy["md_cartera"]) and not md_ok:
+            bullets.append(f"**Duration fuera de banda** ({kpis_hoy['md_cartera']:.2f} años vs. "
+                            f"{md_target_lo:.2f}-{md_target_hi:.2f}): rebalancear entre Tramo 2 (TZXD6) y Tramo 3 "
+                            f"para volver a la banda objetivo.")
+        if pd.notna(tir_t12) and not ok12:
+            direccion = "por debajo" if tir_t12 < BENCHMARK_TRAMO12_LO else "por encima"
+            bullets.append(f"**Tramo 1/2 rinde {direccion} del benchmark TAMAR/CER** ({tir_t12:.1f}% vs. 18-22%): "
+                            f"evaluar rotar Cauciones/S31L6/TZXD6 hacia instrumentos con mejor tasa dentro del mismo "
+                            f"horizonte (≤12 meses), sin resignar liquidez del Tramo Operativo.")
+        if pd.notna(tir_t3) and not ok3:
+            bullets.append(f"**Tramo 3 (Hard-Dollar) rinde distinto del benchmark SHY** ({tir_t3:.1f}% vs. 3,6-3,9%): "
+                            f"con solo 3 papeles y 4,2% del total, hay margen para sumar 1-2 ONs investment-grade "
+                            f"adicionales (sin superar el {limite_emisor_corp:.2f}% por emisor) y capturar mejor spread.")
+        bullets.append("**Calce de vencimientos:** D31M7 (~mar-2027) y D30S6 (~sep-2026) cubren el horizonte del "
+                        "préstamo, pero conviene escalonarlos exactamente contra los hitos de Mes 3/6/9 de desembolso "
+                        "de obra civil y maquinaria, para minimizar el riesgo de tener que vender un DL antes de "
+                        "vencimiento si el pago cae entre medio de dos vencimientos.")
+        bullets.append("**Diversificación del Tramo 3:** hoy son solo 3 instrumentos con pesos individuales muy chicos "
+                        "(1,05%-2,1%). Está lejos del límite de concentración (holgura), pero también lejos de "
+                        "aprovechar todo el presupuesto de riesgo permitido — se puede sumar diversificación sin "
+                        "tocar el perfil de riesgo agregado de la cartera.")
 
-    for b in bullets:
-        st.markdown(f"- {b}")
+        for b in bullets:
+            st.markdown(f"- {b}")
+
+    # ---------------------------------------------------------------------
+    # TAB 5 — Brecha Cambiaria
+    # ---------------------------------------------------------------------
+with tab_brecha:
+    st.markdown("### 💵 Dólar y Brecha Cambiaria")
+    st.caption("Oficial, minorista y bandas de flotación: API pública del BCRA (no requiere API key). "
+               "MEP y CCL: dataset de Alphacast — mismo mecanismo de API key que el resto del panel.")
+
+    cb1, cb2 = st.columns(2)
+    desde_brecha = pd.Timestamp(cb1.date_input("Desde", value=pd.Timestamp(REGIMEN_BANDAS_INICIO),
+                                                key="desde_brecha"))
+    hasta_brecha = pd.Timestamp(cb2.date_input("Hasta", value=as_of_hoy, key="hasta_brecha"))
+
+    with st.expander("⚙️ Fuente de MEP/CCL (Alphacast) — opcional"):
+        fx_dataset_id = st.number_input("Dataset Alphacast (FX premiums)", value=int(FX_DATASET_ID), step=1)
+        st.caption("Si Alphacast reorganiza este dataset y el auto-detect de columnas falla, "
+                   "cambiá el ID acá. El resto de la app no se ve afectado.")
+
+    df_bcra, faltantes_bcra = fetch_bcra_fx_bundle(desde_brecha.strftime("%Y-%m-%d"), hasta_brecha.strftime("%Y-%m-%d"))
+    if faltantes_bcra:
+        st.warning(f"La API del BCRA no devolvió datos para: **{', '.join(faltantes_bcra)}**. "
+                   f"Puede ser un corte temporal del servicio — probá 'Refrescar' más tarde.")
+
+    df_mep_ccl = pd.DataFrame()
+    fuente_mep_ccl = ""
+    if modo_demo:
+        df_mep_ccl = synthetic_fx_bundle(desde_brecha.strftime("%Y-%m-%d"), hasta_brecha.strftime("%Y-%m-%d"))[
+            ["Date", "usd_mep", "usd_ccl"]]
+        fuente_mep_ccl = "Ejemplo (sintético)"
+    elif api_key.strip() and ALPHACAST_AVAILABLE:
+        try:
+            with st.spinner("Descargando MEP/CCL de Alphacast..."):
+                raw_fx = download_dataset(api_key.strip(), int(fx_dataset_id))
+            df_mep_ccl = normalize_fx_dataset(raw_fx)
+            df_mep_ccl = df_mep_ccl[(df_mep_ccl["Date"] >= desde_brecha) & (df_mep_ccl["Date"] <= hasta_brecha)]
+            fuente_mep_ccl = "Alphacast"
+            if df_mep_ccl["usd_mep"].isna().all() or df_mep_ccl["usd_ccl"].isna().all():
+                st.warning(f"No se pudo identificar automáticamente la columna de MEP y/o CCL en el "
+                           f"dataset {fx_dataset_id}. Columnas encontradas: "
+                           f"MEP → `{df_mep_ccl.attrs.get('col_mep')}`, CCL → `{df_mep_ccl.attrs.get('col_ccl')}`. "
+                           f"Revisá el dataset en Alphacast o probá otro ID en 'Fuente de MEP/CCL'.")
+        except Exception as e:
+            st.error(f"No se pudo descargar MEP/CCL de Alphacast (dataset {fx_dataset_id}): {e}")
+    else:
+        st.info("Sin API key de Alphacast: no se puede traer MEP/CCL. Oficial/minorista/bandas sí se "
+                "muestran igual, porque salen de la API pública del BCRA.")
+
+    if df_bcra.empty and df_mep_ccl.empty:
+        st.info("Sin datos disponibles todavía para graficar la brecha.")
+    else:
+        df_fx = df_bcra.copy() if not df_bcra.empty else pd.DataFrame({"Date": df_mep_ccl["Date"]})
+        if not df_mep_ccl.empty:
+            df_fx = df_fx.merge(df_mep_ccl, on="Date", how="outer")
+        df_fx = df_fx.sort_values("Date").reset_index(drop=True)
+        for c in ["usd_oficial", "usd_minorista", "usd_mep", "usd_ccl", "upper_band", "lower_band"]:
+            if c not in df_fx.columns:
+                df_fx[c] = np.nan
+        df_fx = compute_brecha(df_fx)
+
+        ultima = df_fx.dropna(subset=["usd_oficial"]).iloc[-1] if df_fx["usd_oficial"].notna().any() else None
+        k1, k2, k3, k4, k5 = st.columns(5)
+        if ultima is not None:
+            k1.metric("Dólar Oficial", fmt_ars(ultima["usd_oficial"]))
+            k2.metric("Dólar MEP", fmt_ars(ultima["usd_mep"]))
+            k3.metric("Dólar CCL", fmt_ars(ultima["usd_ccl"]))
+            k4.metric("Brecha (MEP vs. Oficial)", f"{ultima['Brecha']*100:.1f}%" if pd.notna(ultima["Brecha"]) else "—")
+            if pd.notna(ultima.get("upper_band")) and pd.notna(ultima.get("lower_band")):
+                pos_banda = (ultima["usd_oficial"] - ultima["lower_band"]) / (ultima["upper_band"] - ultima["lower_band"]) * 100
+                k5.metric("Posición en la banda", f"{pos_banda:.0f}%", "0%=piso · 100%=techo")
+            fecha_ultima = pd.Timestamp(df_fx.loc[df_fx["usd_oficial"].notna(), "Date"].iloc[-1])
+            st.caption(f"Último dato: {fecha_ultima.strftime('%d/%m/%Y')} · Fuente oficial/minorista/bandas: BCRA · "
+                       f"Fuente MEP/CCL: {fuente_mep_ccl or '—'}")
+
+        fig = go.Figure()
+        if df_fx["upper_band"].notna().any():
+            fig.add_trace(go.Scatter(x=df_fx["Date"], y=df_fx["upper_band"], mode="lines", name="Banda superior",
+                                      line=dict(width=1, color=COLORS["warn"], dash="dot")))
+            fig.add_trace(go.Scatter(x=df_fx["Date"], y=df_fx["lower_band"], mode="lines", name="Banda inferior",
+                                      line=dict(width=1, color=COLORS["ok"], dash="dot"),
+                                      fill="tonexty", fillcolor="rgba(148,163,184,0.10)"))
+        fig.add_trace(go.Scatter(x=df_fx["Date"], y=df_fx["usd_oficial"], mode="lines", name="Oficial",
+                                  line=dict(width=2.2, color=COLORS["primary"])))
+        if df_fx["usd_mep"].notna().any():
+            fig.add_trace(go.Scatter(x=df_fx["Date"], y=df_fx["usd_mep"], mode="lines", name="MEP",
+                                      line=dict(width=2.2, color=COLORS["obj2"])))
+        if df_fx["usd_ccl"].notna().any():
+            fig.add_trace(go.Scatter(x=df_fx["Date"], y=df_fx["usd_ccl"], mode="lines", name="CCL",
+                                      line=dict(width=1.6, color=COLORS["accent"], dash="dash")))
+        fig.update_layout(title="Comportamiento del dólar (Oficial, MEP, CCL y bandas de flotación)",
+                           height=440, **PLOTLY_LAYOUT)
+        style_axes(fig, "Fecha", "$ por USD")
+        watermark(fig, hasta_brecha, "BCRA + Alphacast" if not modo_demo else "Ejemplo")
+        st.plotly_chart(fig, use_container_width=True)
+
+        if df_fx["Brecha"].notna().any():
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=df_fx["Date"], y=df_fx["Brecha"] * 100, mode="lines", fill="tozeroy",
+                                       line=dict(width=1.6, color=COLORS["obj2"]),
+                                       fillcolor="rgba(234,88,12,0.18)", name="Brecha"))
+            fig2.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+            fig2.update_layout(title="Brecha cambiaria — (MEP − Oficial) / Oficial", height=340,
+                               **PLOTLY_LAYOUT, showlegend=False)
+            style_axes(fig2, "Fecha", "Brecha (%)")
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Tabla completa")
+        cols_fx = ["Date", "usd_mep", "usd_ccl", "usd_oficial", "usd_minorista", "upper_band", "lower_band", "Brecha"]
+        tabla_fx = df_fx[[c for c in cols_fx if c in df_fx.columns]].copy()
+        tabla_fx["Brecha_%"] = tabla_fx["Brecha"] * 100
+        tabla_fx = tabla_fx.drop(columns=["Brecha"])
+        st.dataframe(tabla_fx, use_container_width=True, height=320,
+                     column_config={"Brecha_%": st.column_config.NumberColumn("Brecha (%)", format="%.2f%%")})
+        csv_fx = tabla_fx.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar brecha cambiaria (CSV)", data=csv_fx,
+                            file_name=f"brecha_cambiaria_{hasta_brecha.strftime('%Y%m%d')}.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------
-# TAB 5 — Metodología
+# TAB 6 — Metodología
 # ---------------------------------------------------------------------
 with tab_metodo:
     st.markdown("""
@@ -976,6 +1233,14 @@ with tab_metodo:
     TAMAR/CER 18%-22% para Tramo 1/2, ETF SHY ≈3,6-3,9% para Tramo 3, y A3500 ≈20% de devaluación
     esperada para la cobertura cambiaria de Objetivo 2.
 
+    **Brecha cambiaria:** Oficial (`Tipo de cambio mayorista de referencia`, idVariable 5), Minorista
+    (idVariable 4) y las bandas de flotación (`Régimen de bandas cambiarias — Límite inferior/superior`,
+    idVariables 1187/1188) salen de la **API pública del BCRA** (`api.bcra.gob.ar/estadisticas/v4.0`),
+    que no requiere API key y está verificada contra los valores históricos reales. MEP y CCL no son
+    series que el BCRA publique (surgen de operar bonos/acciones en distintas plazas): salen de
+    Alphacast, dataset "Markets - Argentina - FX premiums - Daily" (ID configurable en la pestaña).
+    La Brecha se calcula igual que en la planilla original: `(MEP − Oficial) / Oficial`.
+
     **Composición de la cartera:** los 8 instrumentos exactos del IPS del Grupo 8, reconciliando los dos
     gráficos de torta de la presentación (cartera consolidada $175M + detalle de Objetivo 1): **D31M7**
     (79,1%) y **D30S6** (6,9%) — Dollar-Linked, cobertura FX, 86,0% del total — y dentro de Objetivo 1
@@ -996,15 +1261,18 @@ with tab_metodo:
 # ---------------------------------------------------------------------
 st.divider()
 st.subheader("📥 Exportar informe completo (Excel)")
-st.caption("Descarga un .xlsx con el resumen de KPIs, la tabla de holdings de hoy, el detalle de la "
-           "compra del 29/6 y la simulación semanal completa. Es una foto del momento, no un modelo con fórmulas.")
-try:
-    excel_bytes = build_excel_snapshot(tabla, kpis_hoy, port_compra, semanal)
-    st.download_button(
-        "⬇️ Descargar informe Excel (.xlsx)",
-        data=excel_bytes,
-        file_name=f"cartera_grupo8_informe_{as_of_hoy.strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-except Exception as e:
-    st.warning(f"No se pudo generar el Excel: {e}")
+if not data_ok:
+    st.info("Disponible cuando haya datos de mercado cargados (Alphacast o modo de ejemplo).")
+else:
+    st.caption("Descarga un .xlsx con el resumen de KPIs, la tabla de holdings de hoy, el detalle de la "
+               "compra del 29/6 y la simulación semanal completa. Es una foto del momento, no un modelo con fórmulas.")
+    try:
+        excel_bytes = build_excel_snapshot(tabla, kpis_hoy, port_compra, semanal)
+        st.download_button(
+            "⬇️ Descargar informe Excel (.xlsx)",
+            data=excel_bytes,
+            file_name=f"cartera_grupo8_informe_{as_of_hoy.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as e:
+        st.warning(f"No se pudo generar el Excel: {e}")
