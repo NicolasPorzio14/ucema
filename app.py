@@ -473,6 +473,60 @@ def primer_dato_disponible(df_norm: pd.DataFrame, tickers: list) -> dict:
     return out
 
 
+def daily_returns_ticker(df_norm: pd.DataFrame, ticker: str, fecha_inicio: pd.Timestamp,
+                          fecha_fin: pd.Timestamp) -> pd.Series:
+    """Retornos DIARIOS de un ticker a partir de su Paridad cruda, sin resamplear
+    a semanal y SIN forward-fill: un día sin cotización queda NaN de verdad (no
+    se inventa), para no manufacturar retornos "0%" artificiales."""
+    d = df_norm[(df_norm["Ticker"] == ticker) & (df_norm["Date"] >= fecha_inicio) &
+                (df_norm["Date"] <= fecha_fin)][["Date", "Paridad"]].dropna()
+    d = d.drop_duplicates(subset="Date").sort_values("Date")
+    if d.empty:
+        return pd.Series(dtype=float)
+    return d.set_index("Date")["Paridad"].pct_change()
+
+
+def daily_returns_multi(port_df: pd.DataFrame, df_norm: pd.DataFrame, tickers: list,
+                         fecha_inicio: pd.Timestamp, fecha_fin: pd.Timestamp) -> pd.DataFrame:
+    """Igual que extended_weekly_returns pero a frecuencia DIARIA (días hábiles),
+    sin resamplear a lunes — para ganar observaciones dentro de una ventana
+    calendario que ya es corta de por sí (instrumento joven), en vez de
+    conformarse con un puñado de puntos semanales."""
+    fechas = pd.bdate_range(start=fecha_inicio, end=fecha_fin)
+    sub = port_df[port_df["Ticker"].isin(tickers)].copy()
+    peso_total_sub = sub["Peso_pct"].sum()
+    sub["Peso_norm"] = sub["Peso_pct"] / peso_total_sub if peso_total_sub > 0 else 0.0
+
+    hist = df_norm[df_norm["Ticker"].isin(tickers) & (df_norm["Date"] >= fecha_inicio) &
+                   (df_norm["Date"] <= fecha_fin)]
+    piv = hist.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first").sort_index()
+    piv = piv.reindex(fechas)
+    for t in tickers:
+        if t not in piv.columns:
+            piv[t] = np.nan
+
+    ret = piv[tickers].pct_change()
+    w = sub.set_index("Ticker")["Peso_norm"].reindex(tickers).fillna(0.0)
+    peso_disponible = ret.notna().astype(float).mul(w, axis=1).sum(axis=1)
+    contrib = ret.fillna(0.0).mul(w, axis=1).sum(axis=1)
+    ret_total = contrib / peso_disponible.replace(0, np.nan)
+    return pd.DataFrame({"Date": fechas, "ret": ret_total.values,
+                          "peso_cubierto_pct": (peso_disponible * 100).values})
+
+
+def hedge_metrics_from_returns(ret_activo: pd.Series, ret_bench: pd.Series) -> dict:
+    """Hedge Ratio (dollar-offset) y correlación entre dos series de retorno ya
+    alineadas por fecha — agnóstico de si son diarias o semanales."""
+    merged = pd.concat([ret_activo.rename("activo"), ret_bench.rename("bench")], axis=1).dropna()
+    if len(merged) < 3:
+        return dict(n=len(merged), hedge_ratio=np.nan, corr=np.nan, desde=None, hasta=None)
+    cum_activo = (1 + merged["activo"]).prod() - 1
+    cum_bench = (1 + merged["bench"]).prod() - 1
+    hr = (cum_activo / cum_bench * 100) if abs(cum_bench) > 1e-6 else np.nan
+    corr = merged["activo"].corr(merged["bench"])
+    return dict(n=len(merged), hedge_ratio=hr, corr=corr, desde=merged.index.min(), hasta=merged.index.max())
+
+
 def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
                            df_bcra_bench: pd.DataFrame, df_shy: pd.DataFrame) -> tuple:
     """Arma, sobre la MISMA grilla semanal de la simulación de cartera, los
@@ -1299,8 +1353,101 @@ with tab_bench:
             f"{t}: {f.strftime('%d/%m/%Y') if f is not None else 'sin dato en el dataset'}"
             for t, f in primeras_fechas_obj2.items())
         st.caption(f"📅 Primera fecha con precio disponible en el dataset (sin importar la ventana elegida "
-                   f"arriba) — {txt_primeras}. Si estas fechas son recientes, ampliar la ventana no agrega "
-                   f"más historia: **el dataset directamente no tiene más** (instrumentos jóvenes).")
+                   f"arriba, que ya pide {semanas_ext} semanas hacia atrás) — {txt_primeras}. Si el dataset "
+                   f"ya no tiene más historia que esa, ampliar la ventana **no agrega nada**: no es un límite "
+                   f"de cuánto pedimos, es dónde arranca la cotización real de cada papel (instrumentos jóvenes).")
+
+        st.markdown("*Cada bono con su propia ventana real (sin mezclar el hueco de datos de uno con el otro):*")
+        filas_por_ticker = []
+        for tk in obj2_tickers:
+            ret_tk, _, _ = extended_weekly_returns(port_df, df_norm, [tk], as_of_hoy, semanas_ext)
+            merged_tk = ret_tk.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
+            merged_tk["ret_A3500"] = merged_tk["A3500"].pct_change()
+            validos_tk = merged_tk.dropna(subset=["ret"])
+            peso_tk = port_df.loc[port_df["Ticker"] == tk, "Peso_pct"].sum()
+            if len(validos_tk) >= 3:
+                cum_tk = (1 + validos_tk["ret"]).cumprod().iloc[-1] - 1
+                cum_a3500_tk = (1 + validos_tk["ret_A3500"].fillna(0)).cumprod().iloc[-1] - 1
+                hr_tk = (cum_tk / cum_a3500_tk * 100) if abs(cum_a3500_tk) > 1e-6 else np.nan
+                corr_tk = validos_tk["ret"].corr(validos_tk["ret_A3500"])
+                filas_por_ticker.append(dict(
+                    Ticker=tk, Peso_en_cartera=peso_tk, N_semanas_propias=len(validos_tk),
+                    Desde=validos_tk["Date"].iloc[0], Hasta=validos_tk["Date"].iloc[-1],
+                    Hedge_Ratio=hr_tk, Correlacion=corr_tk))
+            else:
+                filas_por_ticker.append(dict(
+                    Ticker=tk, Peso_en_cartera=peso_tk, N_semanas_propias=len(validos_tk),
+                    Desde=None, Hasta=None, Hedge_Ratio=np.nan, Correlacion=np.nan))
+        tabla_por_ticker = pd.DataFrame(filas_por_ticker)
+        st.dataframe(tabla_por_ticker, use_container_width=True, hide_index=True,
+                     column_config={
+                         "Peso_en_cartera": st.column_config.NumberColumn("Peso en cartera", format="%.1f%%"),
+                         "N_semanas_propias": st.column_config.NumberColumn("N° semanas propias"),
+                         "Desde": st.column_config.DateColumn("Desde", format="DD/MM/YYYY"),
+                         "Hasta": st.column_config.DateColumn("Hasta", format="DD/MM/YYYY"),
+                         "Hedge_Ratio": st.column_config.NumberColumn("Hedge Ratio", format="%.0f%%"),
+                         "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
+                     })
+        st.caption("Este desglose es el más confiable de los tres: cada bono se compara contra el A3500 "
+                   "únicamente en las semanas donde ESE bono en particular tiene precio — sin que la falta "
+                   "de historia de uno contamine al otro. Si acá ves pocas 'N° semanas propias', no es un "
+                   "problema de ventana pedida: es que el papel recién empezó a cotizar.")
+
+        st.markdown("*Análisis diario (mismo calendario, más observaciones):*")
+        fechas_reales_validas = [f for f in primeras_fechas_obj2.values() if f is not None]
+        if fechas_reales_validas:
+            fecha_tope_diaria = max(fechas_reales_validas)  # el que arrancó más tarde = el límite común
+            ticker_tope = [t for t, f in primeras_fechas_obj2.items() if f == fecha_tope_diaria][0]
+            st.caption(f"No hay más calendario para pedir hacia atrás ({ticker_tope} se emitió/empezó a "
+                       f"cotizar el {fecha_tope_diaria.strftime('%d/%m/%Y')}), pero **dentro de esas mismas "
+                       f"semanas** se puede mirar día por día en vez de solo los lunes — mucha más muestra "
+                       f"sin pedirle al dataset historia que no tiene.")
+
+            if modo_demo:
+                a3500_diario = synthetic_benchmark_series(
+                    fecha_tope_diaria.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))[["Date", "A3500"]]
+                a3500_diario = a3500_diario.rename(columns={"A3500": "Valor"})
+            else:
+                a3500_diario = fetch_bcra_variable(BCRA_VARS["usd_oficial"],
+                                                    fecha_tope_diaria.strftime("%Y-%m-%d"),
+                                                    as_of_hoy.strftime("%Y-%m-%d"))
+            ret_a3500_diario = a3500_diario.set_index("Date")["Valor"].pct_change()
+
+            filas_diario = []
+            for tk in obj2_tickers:
+                ret_tk_d = daily_returns_ticker(df_norm, tk, fecha_tope_diaria, as_of_hoy)
+                m = hedge_metrics_from_returns(ret_tk_d, ret_a3500_diario)
+                filas_diario.append(dict(
+                    Ticker=tk, N_obs_diarias=m["n"],
+                    Desde=m["desde"], Hasta=m["hasta"],
+                    Hedge_Ratio=m["hedge_ratio"], Correlacion=m["corr"]))
+            ret_obj2_diario = daily_returns_multi(port_df, df_norm, obj2_tickers, fecha_tope_diaria, as_of_hoy)
+            m_comb = hedge_metrics_from_returns(
+                ret_obj2_diario.set_index("Date")["ret"], ret_a3500_diario)
+            filas_diario.append(dict(
+                Ticker="Objetivo 2 (combinado)", N_obs_diarias=m_comb["n"],
+                Desde=m_comb["desde"], Hasta=m_comb["hasta"],
+                Hedge_Ratio=m_comb["hedge_ratio"], Correlacion=m_comb["corr"]))
+
+            tabla_diaria = pd.DataFrame(filas_diario)
+            st.dataframe(tabla_diaria, use_container_width=True, hide_index=True,
+                         column_config={
+                             "N_obs_diarias": st.column_config.NumberColumn("N° obs. diarias"),
+                             "Desde": st.column_config.DateColumn("Desde", format="DD/MM/YYYY"),
+                             "Hasta": st.column_config.DateColumn("Hasta", format="DD/MM/YYYY"),
+                             "Hedge_Ratio": st.column_config.NumberColumn("Hedge Ratio", format="%.0f%%"),
+                             "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
+                         })
+            fila_d31 = next((f for f in filas_diario if f["Ticker"] == ticker_tope), None)
+            n_semanal_equiv = int(np.ceil((as_of_hoy - fecha_tope_diaria).days / 7))
+            if fila_d31:
+                st.caption(f"Con el mismo calendario, la versión semanal daba ~{n_semanal_equiv} observaciones "
+                           f"por ticker; la diaria da hasta {tabla_diaria['N_obs_diarias'].max()}. Sigue "
+                           f"aplicando el mismo caveat de Paridad-vs-Valor-Técnico de más arriba — más "
+                           f"observaciones no lo resuelve si el problema es metodológico, pero si es de "
+                           f"muestra chica, esto ya debería estabilizar bastante los números.")
+        else:
+            st.info("Ningún ticker de Objetivo 2 tiene dato en el dataset — no se puede armar el análisis diario.")
 
         ext_ret_obj2, ext_faltan_obj2, _ = extended_weekly_returns(
             port_df, df_norm, obj2_tickers, as_of_hoy, semanas_ext)
@@ -1315,6 +1462,9 @@ with tab_bench:
         # rango pedido) mientras el A3500 sí acumula devaluación en esas mismas
         # semanas "vacías" infla artificialmente la devaluación del denominador
         # y hunde el Hedge Ratio, aunque la cobertura esté funcionando bien.
+        st.markdown("*Objetivo 2 combinado (D31M7 + D30S6 ponderado — se recalcula el peso relativo cada "
+                    "semana entre los que sí tienen dato; puede quedar dominado por un solo papel si el "
+                    "otro todavía no cotizaba):*")
         validos_obj2 = merged_obj2.dropna(subset=["ret"])
         if len(validos_obj2) >= 8:
             fecha_ini_valida = validos_obj2["Date"].iloc[0]
