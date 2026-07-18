@@ -565,6 +565,57 @@ def information_ratio(returns: pd.Series, benchmark: pd.Series, periods_per_year
     return float(active.mean() / sd * np.sqrt(periods_per_year))
 
 
+def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, tickers: list,
+                             fecha_fin: pd.Timestamp, semanas: int) -> tuple:
+    """Serie semanal de retornos PONDERADOS POR PESO (no por VN comprado) de un
+    subconjunto de la cartera (ej. Objetivo 1), extendida 'semanas' semanas
+    hacia atrás desde 'fecha_fin'. Existe SOLO para darle más tamaño de
+    muestra al cálculo de Sharpe/Sortino/Information Ratio — no es la
+    simulación de tenencia real (esa vive en 'semanal', a nominales fijos
+    desde la compra). Cada semana pondera solo entre los tickers que
+    efectivamente tienen dato ese día (re-normalizando por el peso
+    disponible), en vez de asumir retorno cero en los que falten.
+    Devuelve (df[Date, ret], tickers_sin_ningun_dato, fecha_inicio_real)."""
+    fecha_fin = pd.Timestamp(fecha_fin)
+    fecha_inicio = fecha_fin - pd.Timedelta(weeks=int(semanas))
+    fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, freq="W-MON")
+    if fecha_fin not in fechas:
+        fechas = fechas.append(pd.DatetimeIndex([fecha_fin]))
+    fechas = pd.DatetimeIndex(sorted(fechas.unique()))
+
+    sub = port_df[port_df["Ticker"].isin(tickers)].copy()
+    peso_total_sub = sub["Peso_pct"].sum()
+    sub["Peso_norm"] = sub["Peso_pct"] / peso_total_sub if peso_total_sub > 0 else 0.0
+
+    bonos = sub.loc[~sub["Es_Cash"], "Ticker"].tolist()
+    hist = df_norm[df_norm["Ticker"].isin(bonos)]
+    piv_par = hist.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first").sort_index()
+    idx_union = pd.DatetimeIndex(sorted(set(list(piv_par.index)) | set(fechas)))
+    piv_par = piv_par.reindex(idx_union).ffill().reindex(fechas)
+    for t in bonos:
+        if t not in piv_par.columns:
+            piv_par[t] = np.nan
+    faltan = [t for t in bonos if piv_par[t].isna().all()]
+
+    ret_bonos = piv_par[bonos].pct_change()
+    w_bonos = sub.set_index("Ticker")["Peso_norm"].reindex(bonos).fillna(0.0)
+    peso_disponible = ret_bonos.notna().astype(float).mul(w_bonos, axis=1).sum(axis=1)
+    contrib_bonos = ret_bonos.fillna(0.0).mul(w_bonos, axis=1).sum(axis=1)
+
+    cash_rows = sub[sub["Es_Cash"]]
+    w_cash = float(cash_rows["Peso_norm"].sum()) if not cash_rows.empty else 0.0
+    tna = float(cash_rows["TNA_Manual_pct"].iloc[0]) if not cash_rows.empty else 0.0
+    ret_cash_semanal = (1 + tna / 100.0) ** (7 / 365.0) - 1
+
+    peso_total_disponible = peso_disponible + w_cash
+    ret_total = (contrib_bonos + w_cash * ret_cash_semanal) / peso_total_disponible.replace(0, np.nan)
+    ret_total.iloc[0] = np.nan  # la primera fecha de la serie no tiene retorno (no hay período previo)
+
+    out = pd.DataFrame({"Date": fechas, "ret": ret_total.values,
+                         "peso_cubierto_pct": (peso_total_disponible * 100).values})
+    return out, faltan, fecha_inicio
+
+
 # =====================================================================
 # Motor de cartera: snapshot ponderado y KPIs (para "Cartera Hoy")
 # =====================================================================
@@ -1165,48 +1216,122 @@ with tab_bench:
             c4.metric("SHY en pesos (acumulado)", f"{u['idx_SHY_ars'] - 100:+.1f}%" if pd.notna(u["idx_SHY_ars"]) else "—")
 
         st.divider()
-        st.markdown("### 📊 Ratios de riesgo-retorno")
-        st.caption("Sharpe, Sortino e Information Ratio, anualizados (×√52), calculados sobre los "
-                   "rendimientos SEMANALES ya REALIZADOS (se excluyen las semanas proyectadas). Tasa "
-                   "libre de riesgo: TNA de la caución/money market.")
+        st.markdown("### 📊 Ratios de riesgo-retorno — Objetivo 1 (Capital de Trabajo)")
+        st.caption("Sharpe, Sortino e Information Ratio tienen sentido económico en Objetivo 1 (busca "
+                   "capturar tasa/carry). En Objetivo 2 y en la Cartera Total **no** se muestran estos "
+                   "ratios: son cobertura cambiaria, no gestión activa de retorno — ver más abajo la "
+                   "métrica de efectividad de cobertura, que es la que corresponde a ese mandato.")
 
-        realizado = obj_rets[obj_rets["Estado"] != "Proyectado"]
-        n_semanas = int(realizado["ret_Total"].notna().sum())
-        if n_semanas < 8:
-            st.warning(f"⚠️ Solo hay **{n_semanas} semana(s)** de datos realizados desde la compra. Con una "
-                       f"muestra tan chica, Sharpe/Sortino/Information Ratio son poco confiables "
-                       f"estadísticamente — quedan acá como referencia metodológica, y se vuelven más "
-                       f"representativos a medida que se acumule historia real.")
+        semanas_ext = st.slider("Semanas de historia para calcular estos ratios", min_value=8, max_value=104,
+                                 value=26, step=2,
+                                 help="Amplía la muestra hacia atrás usando una serie ponderada por peso "
+                                      "(no por VN comprado) de los mismos instrumentos de Objetivo 1 — "
+                                      "SOLO para que Sharpe/Sortino/IR tengan una base estadística más "
+                                      "razonable que las pocas semanas reales desde la compra.")
 
-        merged = realizado.merge(bench_tabla, on="Date", how="left")
+        obj1_tickers = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Ticker"].tolist()
+        ext_ret, ext_faltan, fecha_inicio_ext = extended_weekly_returns(
+            port_df, df_norm, obj1_tickers, as_of_hoy, semanas_ext)
+        n_semanas_ext = int(ext_ret["ret"].notna().sum())
+
+        df_bench_ext = fetch_benchmark_bcra(fecha_inicio_ext.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d")) \
+            if not modo_demo else synthetic_benchmark_series(fecha_inicio_ext.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))
+        df_shy_ext = fetch_shy_series(fecha_inicio_ext.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d")) \
+            if not modo_demo else df_bench_ext[["Date", "SHY"]].rename(columns={"SHY": "Valor"})
+        if modo_demo:
+            df_bench_ext = df_bench_ext[["Date", "A3500", "CER"]]
+        bench_ext, _ = build_benchmark_table(port_df, pd.DatetimeIndex(ext_ret["Date"]), df_bench_ext, df_shy_ext)
+
+        if n_semanas_ext < 8:
+            st.warning(f"⚠️ Solo **{n_semanas_ext} semana(s)** con dato utilizable en la ventana elegida "
+                       f"({fecha_inicio_ext.strftime('%d/%m/%Y')} en adelante). Con tan poca muestra, estos "
+                       f"ratios siguen siendo poco confiables — probá ampliar la ventana si el dataset lo permite.")
+        if ext_faltan:
+            st.caption(f"Sin ninguna historia en el dataset para: **{', '.join(ext_faltan)}** dentro de la "
+                       f"ventana elegida — quedan afuera del cálculo (no se les asume retorno cero).")
+
+        merged_ext = ext_ret.merge(bench_ext, on="Date", how="left")
         tna_rf = float(port_df.loc[port_df["Es_Cash"], "TNA_Manual_pct"].iloc[0]) if port_df["Es_Cash"].any() else 0.0
         rf_semanal = (1 + tna_rf / 100.0) ** (7 / 365.0) - 1
 
-        filas_ratio = []
-        for nombre, ret_col, bench_col in [
-            ("Cartera Total", "ret_Total", "ret_total_bench"),
-            ("Objetivo 1 · Capital de Trabajo", "ret_Obj1", "ret_obj1_bench"),
-            ("Objetivo 2 · Cobertura FX", "ret_Obj2", "ret_obj2_bench"),
-        ]:
-            r, b = merged[ret_col], merged[bench_col]
-            filas_ratio.append(dict(
-                Cartera=nombre,
-                Sharpe=sharpe_ratio(r, rf_semanal),
-                Sortino=sortino_ratio(r, rf_semanal),
-                Information_Ratio=information_ratio(r, b),
-                N_semanas=int(r.notna().sum()),
-            ))
-        tabla_ratios = pd.DataFrame(filas_ratio)
-        st.dataframe(tabla_ratios, use_container_width=True, hide_index=True,
+        sh = sharpe_ratio(merged_ext["ret"], rf_semanal)
+        so = sortino_ratio(merged_ext["ret"], rf_semanal)
+        ir = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Sharpe Ratio", f"{sh:.2f}" if pd.notna(sh) else "—")
+        r2.metric("Sortino Ratio", f"{so:.2f}" if pd.notna(so) else "—")
+        r3.metric("Information Ratio", f"{ir:.2f}" if pd.notna(ir) else "—")
+        r4.metric("N° semanas usadas", f"{n_semanas_ext}")
+        st.caption(f"Tasa libre de riesgo: TNA caución {tna_rf:.1f}% → {rf_semanal*100:.3f}% semanal. "
+                   f"Benchmark del Information Ratio: el compuesto de Objetivo 1 (CER + SHY) de la sección de arriba. "
+                   f"Ventana usada: {fecha_inicio_ext.strftime('%d/%m/%Y')} → {as_of_hoy.strftime('%d/%m/%Y')}.")
+
+        st.divider()
+        st.markdown("### 🛡️ Efectividad de Cobertura — Objetivo 2 y Cartera Total")
+        st.caption("Objetivo 2 y la Cartera Total (86% Dollar-Linked) no buscan retorno ajustado por "
+                   "riesgo: buscan CALZAR una obligación en dólares. Por eso se miden con métricas de "
+                   "cobertura, no con Sharpe/Sortino/Information Ratio.")
+
+        realizado = obj_rets[obj_rets["Estado"] != "Proyectado"]
+        n_semanas_real = int(realizado["ret_Total"].notna().sum())
+        merged_real = realizado.merge(bench_tabla, on="Date", how="left")
+
+        st.markdown("**Objetivo 2 · Calidad del hedge (dollar-offset)**")
+        obj2_val = obj_rets.loc[obj_rets["Estado"] != "Proyectado", "Valor_Obj2"].dropna()
+        a3500_real = merged_real["A3500"].dropna() if "A3500" in merged_real.columns else pd.Series(dtype=float)
+        if len(obj2_val) >= 2 and len(a3500_real) >= 2:
+            ret_obj2_cum = obj2_val.iloc[-1] / obj2_val.iloc[0] - 1
+            ret_a3500_cum = merged_real["A3500"].iloc[-1] / merged_real["A3500"].iloc[0] - 1
+            hedge_ratio = (ret_obj2_cum / ret_a3500_cum * 100) if abs(ret_a3500_cum) > 1e-9 else np.nan
+            corr_obj2_a3500 = merged_real["ret_Obj2"].corr(merged_real["ret_A3500"])
+            h1, h2, h3 = st.columns(3)
+            h1.metric("Hedge Ratio (dollar-offset)", f"{hedge_ratio:.0f}%" if pd.notna(hedge_ratio) else "—",
+                      "100% = calzó 1:1 con la devaluación")
+            h2.metric("Correlación semanal vs. A3500", f"{corr_obj2_a3500:.2f}" if pd.notna(corr_obj2_a3500) else "—")
+            h3.metric("N° semanas (realizado)", f"{n_semanas_real}")
+            st.caption("Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, "
+                       "en el mismo período realizado. >100%: la cobertura rindió por encima de la pura "
+                       "devaluación (spread propio de los DL). <100%: quedó por detrás — revisar calce. "
+                       "Con pocas semanas, la correlación es igual de poco confiable que un ratio clásico.")
+        else:
+            st.info("Todavía no hay suficientes semanas realizadas para calcular el Hedge Ratio.")
+
+        st.markdown("**Cartera Total · Cobertura de las necesidades en USD del cronograma del préstamo**")
+        fecha_desembolso_ts = pd.Timestamp(fecha_desembolso)
+        hitos_usd = [("Mes 3 (obra civil)", 90, 7300), ("Mes 6 (obra civil)", 180, 10500),
+                     ("Mes 9 (obra civil + maquinaria)", 270, 16700 + 50000)]
+        filas_usd = []
+        for nombre, dias, monto_usd in hitos_usd:
+            fecha_hito = fecha_desembolso_ts + pd.Timedelta(days=dias)
+            if fecha_hito < semanal["Date"].min() or fecha_hito > semanal["Date"].max():
+                filas_usd.append(dict(Hito=nombre, Fecha=fecha_hito, USD_Necesario=monto_usd,
+                                       Valor_Obj2_ARS=np.nan, FX=np.nan, Valor_Obj2_USD=np.nan, Cobertura_pct=np.nan))
+                continue
+            idx_cercano = (semanal["Date"] - fecha_hito).abs().idxmin()
+            fila_sem = semanal.loc[idx_cercano]
+            fila_bench = bench_tabla.loc[(bench_tabla["Date"] - fecha_hito).abs().idxmin()]
+            valor_obj2_ars = fila_sem.get("Valor_D31M7", 0.0) + fila_sem.get("Valor_D30S6", 0.0)
+            fx = fila_bench.get("A3500", np.nan)
+            valor_obj2_usd = valor_obj2_ars / fx if pd.notna(fx) and fx > 0 else np.nan
+            cobertura = (valor_obj2_usd / monto_usd * 100) if pd.notna(valor_obj2_usd) else np.nan
+            filas_usd.append(dict(Hito=nombre, Fecha=fila_sem["Date"], USD_Necesario=monto_usd,
+                                   Valor_Obj2_ARS=valor_obj2_ars, FX=fx, Valor_Obj2_USD=valor_obj2_usd,
+                                   Cobertura_pct=cobertura))
+        tabla_usd = pd.DataFrame(filas_usd)
+        st.dataframe(tabla_usd, use_container_width=True, hide_index=True,
                      column_config={
-                         "Sharpe": st.column_config.NumberColumn("Sharpe Ratio", format="%.2f"),
-                         "Sortino": st.column_config.NumberColumn("Sortino Ratio", format="%.2f"),
-                         "Information_Ratio": st.column_config.NumberColumn("Information Ratio", format="%.2f"),
-                         "N_semanas": st.column_config.NumberColumn("N° semanas", format="%d"),
+                         "Fecha": st.column_config.DateColumn("Fecha (más cercana)", format="DD/MM/YYYY"),
+                         "USD_Necesario": st.column_config.NumberColumn("USD necesario", format="US$ %.0f"),
+                         "Valor_Obj2_ARS": st.column_config.NumberColumn("Valor Objetivo 2 (ARS)", format="$ %.0f"),
+                         "FX": st.column_config.NumberColumn("A3500 en la fecha", format="%.0f"),
+                         "Valor_Obj2_USD": st.column_config.NumberColumn("Valor Objetivo 2 (USD)", format="US$ %.0f"),
+                         "Cobertura_pct": st.column_config.NumberColumn("Cobertura", format="%.0f%%"),
                      })
-        st.caption(f"Tasa libre de riesgo usada: TNA caución {tna_rf:.1f}% → {rf_semanal*100:.3f}% semanal. "
-                   "Information Ratio de cada Objetivo usa su propio benchmark compuesto (ver arriba); "
-                   "el de la Cartera Total usa el benchmark ponderado por el peso de cada Objetivo.")
+        st.caption("Convierte el valor de Objetivo 2 (D31M7+D30S6, realizado o proyectado según la fecha) "
+                   "a USD con el A3500 de esa misma fecha, y lo compara contra el monto en USD que exige "
+                   "cada hito del cronograma de desembolsos (según la fecha de desembolso del préstamo, "
+                   "en la barra lateral). ≥100% = la cobertura alcanza para ese hito.")
 
     # ---------------------------------------------------------------------
     # TAB 5 — Brecha Cambiaria
