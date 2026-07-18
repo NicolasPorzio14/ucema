@@ -1181,7 +1181,6 @@ with tab_bench:
 
         fechas_grid = pd.DatetimeIndex(semanal["Date"])
         bench_tabla, pesos_bench = build_benchmark_table(port_df, fechas_grid, df_bench_bcra, df_shy)
-        obj_rets = objetivo_returns_from_semanal(semanal, port_df)
 
         cartera_idx = 100 * semanal["Valor_Cartera"] / semanal["Valor_Cartera"].iloc[0]
 
@@ -1222,14 +1221,16 @@ with tab_bench:
                    "ratios: son cobertura cambiaria, no gestión activa de retorno — ver más abajo la "
                    "métrica de efectividad de cobertura, que es la que corresponde a ese mandato.")
 
-        semanas_ext = st.slider("Semanas de historia para calcular estos ratios", min_value=8, max_value=104,
-                                 value=26, step=2,
+        semanas_ext = st.slider("Semanas de historia para calcular estos ratios y la cobertura de Objetivo 2",
+                                 min_value=8, max_value=104, value=26, step=2,
                                  help="Amplía la muestra hacia atrás usando una serie ponderada por peso "
-                                      "(no por VN comprado) de los mismos instrumentos de Objetivo 1 — "
-                                      "SOLO para que Sharpe/Sortino/IR tengan una base estadística más "
-                                      "razonable que las pocas semanas reales desde la compra.")
+                                      "(no por VN comprado) de los mismos instrumentos — SOLO para que "
+                                      "estos indicadores tengan una base estadística más razonable que "
+                                      "las pocas semanas reales desde la compra. Se usa tanto para los "
+                                      "ratios de Objetivo 1 como para el Hedge Ratio de Objetivo 2, más abajo.")
 
         obj1_tickers = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Ticker"].tolist()
+        obj2_tickers = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Ticker"].tolist()
         ext_ret, ext_faltan, fecha_inicio_ext = extended_weekly_returns(
             port_df, df_norm, obj1_tickers, as_of_hoy, semanas_ext)
         n_semanas_ext = int(ext_ret["ret"].notna().sum())
@@ -1251,20 +1252,26 @@ with tab_bench:
                        f"ventana elegida — quedan afuera del cálculo (no se les asume retorno cero).")
 
         merged_ext = ext_ret.merge(bench_ext, on="Date", how="left")
-        tna_rf = float(port_df.loc[port_df["Es_Cash"], "TNA_Manual_pct"].iloc[0]) if port_df["Es_Cash"].any() else 0.0
-        rf_semanal = (1 + tna_rf / 100.0) ** (7 / 365.0) - 1
 
-        sh = sharpe_ratio(merged_ext["ret"], rf_semanal)
-        so = sortino_ratio(merged_ext["ret"], rf_semanal)
+        # Sharpe/Sortino SIN tasa libre de riesgo (retorno/desvío puro). Restar la TNA
+        # de la caución (una tasa nominal alta, ~30%) contra retornos de precio (Paridad)
+        # de instrumentos de menor volatilidad exagera el "excess return" negativo y
+        # distorsiona el número — por eso se usa rf=0 acá.
+        sh = sharpe_ratio(merged_ext["ret"], 0.0)
+        so = sortino_ratio(merged_ext["ret"], 0.0)
         ir = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
 
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Sharpe Ratio", f"{sh:.2f}" if pd.notna(sh) else "—")
-        r2.metric("Sortino Ratio", f"{so:.2f}" if pd.notna(so) else "—")
+        r1.metric("Sharpe (sin tasa libre de riesgo)", f"{sh:.2f}" if pd.notna(sh) else "—")
+        r2.metric("Sortino (sin tasa libre de riesgo)", f"{so:.2f}" if pd.notna(so) else "—")
         r3.metric("Information Ratio", f"{ir:.2f}" if pd.notna(ir) else "—")
         r4.metric("N° semanas usadas", f"{n_semanas_ext}")
-        st.caption(f"Tasa libre de riesgo: TNA caución {tna_rf:.1f}% → {rf_semanal*100:.3f}% semanal. "
-                   f"Benchmark del Information Ratio: el compuesto de Objetivo 1 (CER + SHY) de la sección de arriba. "
+        st.caption("Sharpe = retorno medio semanal ÷ desvío semanal (anualizado ×√52) — **sin** restar la "
+                   "TNA de la caución. Sortino: igual, pero el desvío solo considera semanas con retorno "
+                   "negativo. Se omite la tasa libre de riesgo porque estos retornos vienen de la Paridad "
+                   "(precio de mercado) y no siempre son directamente comparables contra una tasa nominal "
+                   "de money-market — restarla puede exagerar artificialmente un Sharpe negativo. "
+                   f"Benchmark del Information Ratio: el compuesto de Objetivo 1 (CER + SHY). "
                    f"Ventana usada: {fecha_inicio_ext.strftime('%d/%m/%Y')} → {as_of_hoy.strftime('%d/%m/%Y')}.")
 
         st.divider()
@@ -1273,29 +1280,41 @@ with tab_bench:
                    "riesgo: buscan CALZAR una obligación en dólares. Por eso se miden con métricas de "
                    "cobertura, no con Sharpe/Sortino/Information Ratio.")
 
-        realizado = obj_rets[obj_rets["Estado"] != "Proyectado"]
-        n_semanas_real = int(realizado["ret_Total"].notna().sum())
-        merged_real = realizado.merge(bench_tabla, on="Date", how="left")
-
         st.markdown("**Objetivo 2 · Calidad del hedge (dollar-offset)**")
-        obj2_val = obj_rets.loc[obj_rets["Estado"] != "Proyectado", "Valor_Obj2"].dropna()
-        a3500_real = merged_real["A3500"].dropna() if "A3500" in merged_real.columns else pd.Series(dtype=float)
-        if len(obj2_val) >= 2 and len(a3500_real) >= 2:
-            ret_obj2_cum = obj2_val.iloc[-1] / obj2_val.iloc[0] - 1
-            ret_a3500_cum = merged_real["A3500"].iloc[-1] / merged_real["A3500"].iloc[0] - 1
-            hedge_ratio = (ret_obj2_cum / ret_a3500_cum * 100) if abs(ret_a3500_cum) > 1e-9 else np.nan
-            corr_obj2_a3500 = merged_real["ret_Obj2"].corr(merged_real["ret_A3500"])
+        ext_ret_obj2, ext_faltan_obj2, _ = extended_weekly_returns(
+            port_df, df_norm, obj2_tickers, as_of_hoy, semanas_ext)
+        merged_obj2 = ext_ret_obj2.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
+        merged_obj2["ret_A3500"] = merged_obj2["A3500"].pct_change()
+        n_semanas_hedge = int(merged_obj2["ret"].notna().sum())
+
+        validos_obj2 = merged_obj2.dropna(subset=["ret"])
+        if len(validos_obj2) >= 8:
+            cum_obj2 = (1 + merged_obj2["ret"].fillna(0)).cumprod()
+            cum_a3500 = (1 + merged_obj2["ret_A3500"].fillna(0)).cumprod()
+            ret_obj2_cum = cum_obj2.iloc[-1] - 1
+            ret_a3500_cum = cum_a3500.iloc[-1] - 1
+            hedge_ratio = (ret_obj2_cum / ret_a3500_cum * 100) if abs(ret_a3500_cum) > 1e-6 else np.nan
+            corr_obj2_a3500 = merged_obj2["ret"].corr(merged_obj2["ret_A3500"])
             h1, h2, h3 = st.columns(3)
             h1.metric("Hedge Ratio (dollar-offset)", f"{hedge_ratio:.0f}%" if pd.notna(hedge_ratio) else "—",
                       "100% = calzó 1:1 con la devaluación")
             h2.metric("Correlación semanal vs. A3500", f"{corr_obj2_a3500:.2f}" if pd.notna(corr_obj2_a3500) else "—")
-            h3.metric("N° semanas (realizado)", f"{n_semanas_real}")
-            st.caption("Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, "
-                       "en el mismo período realizado. >100%: la cobertura rindió por encima de la pura "
-                       "devaluación (spread propio de los DL). <100%: quedó por detrás — revisar calce. "
-                       "Con pocas semanas, la correlación es igual de poco confiable que un ratio clásico.")
+            h3.metric("N° semanas usadas", f"{n_semanas_hedge}")
+            st.caption(f"Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, en "
+                       f"la misma ventana extendida de arriba ({fecha_inicio_ext.strftime('%d/%m/%Y')} → "
+                       f"{as_of_hoy.strftime('%d/%m/%Y')}, no solo las semanas realizadas desde la compra). "
+                       f">100%: la cobertura rindió por encima de la pura devaluación (spread propio de los "
+                       f"DL). <100%: quedó por detrás. La correlación debería ser fuertemente positiva si "
+                       f"el hedge funciona bien — si sale negativa o errática con pocas semanas, es señal "
+                       f"de que la muestra todavía es chica, no de que la cobertura esté fallando.")
         else:
-            st.info("Todavía no hay suficientes semanas realizadas para calcular el Hedge Ratio.")
+            st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
+                       f"muy poco para que el Hedge Ratio o la correlación signifiquen algo. Probá ampliar "
+                       f"la ventana arriba (D31M7/D30S6 son instrumentos jóvenes: puede que el dataset "
+                       f"tampoco tenga mucha más historia disponible).")
+        if ext_faltan_obj2:
+            st.caption(f"Sin ninguna historia en el dataset para: **{', '.join(ext_faltan_obj2)}** dentro "
+                       f"de la ventana elegida.")
 
         st.markdown("**Cartera Total · Cobertura de las necesidades en USD del cronograma del préstamo**")
         fecha_desembolso_ts = pd.Timestamp(fecha_desembolso)
