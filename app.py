@@ -1446,6 +1446,33 @@ with tab_bench:
                            f"aplicando el mismo caveat de Paridad-vs-Valor-Técnico de más arriba — más "
                            f"observaciones no lo resuelve si el problema es metodológico, pero si es de "
                            f"muestra chica, esto ya debería estabilizar bastante los números.")
+
+            with st.expander("🔍 Ver el dataset DIARIO con el que se calcula esta tabla (para auditar)"):
+                crudo_d = df_norm[(df_norm["Ticker"].isin(obj2_tickers)) & (df_norm["Date"] >= fecha_tope_diaria) &
+                                  (df_norm["Date"] <= as_of_hoy)][["Date", "Ticker", "Paridad", "TIR"]]
+                piv_paridad_d = crudo_d.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first")
+                piv_tir_d = crudo_d.pivot_table(index="Date", columns="Ticker", values="TIR", aggfunc="first")
+                piv_paridad_d.columns = [f"Paridad_{c}" for c in piv_paridad_d.columns]
+                piv_tir_d.columns = [f"TIR_{c}" for c in piv_tir_d.columns]
+                auditoria_d = ret_obj2_diario.rename(columns={"ret": "Retorno_Obj2_ponderado"})
+                auditoria_d = auditoria_d.merge(a3500_diario.rename(columns={"Valor": "A3500"}), on="Date", how="left")
+                auditoria_d["Retorno_A3500"] = auditoria_d["A3500"].pct_change()
+                auditoria_d = auditoria_d.merge(piv_paridad_d.reset_index(), on="Date", how="left")
+                auditoria_d = auditoria_d.merge(piv_tir_d.reset_index(), on="Date", how="left")
+                st.dataframe(auditoria_d.sort_values("Date"), use_container_width=True, height=320,
+                             column_config={
+                                 "Retorno_Obj2_ponderado": st.column_config.NumberColumn("Retorno Obj.2 (ponderado)", format="%.3f%%"),
+                                 "A3500": st.column_config.NumberColumn("A3500", format="%.1f"),
+                                 "Retorno_A3500": st.column_config.NumberColumn("Retorno A3500", format="%.3f%%"),
+                             })
+                st.caption(f"Grilla de DÍAS HÁBILES desde {fecha_tope_diaria.strftime('%d/%m/%Y')} hasta "
+                           f"{as_of_hoy.strftime('%d/%m/%Y')} — distinta de la tabla semanal de más abajo. "
+                           f"Un Paridad_ vacío en un día hábil es normal si ese papel no operó justo ese día "
+                           f"(iliquidez), no significa que falte cargar nada.")
+                csv_auditoria_d = auditoria_d.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Descargar dataset DIARIO de auditoría (CSV)", data=csv_auditoria_d,
+                                    file_name=f"auditoria_hedge_diario_obj2_{as_of_hoy.strftime('%Y%m%d')}.csv",
+                                    mime="text/csv", key="dl_auditoria_diaria")
         else:
             st.info("Ningún ticker de Objetivo 2 tiene dato en el dataset — no se puede armar el análisis diario.")
 
@@ -1505,7 +1532,7 @@ with tab_bench:
             st.caption(f"Sin ninguna historia en el dataset para: **{', '.join(ext_faltan_obj2)}** dentro "
                        f"de la ventana elegida.")
 
-        with st.expander("🔍 Ver el dataset con el que se calcula este Hedge Ratio (para auditar)"):
+        with st.expander("🔍 Ver el dataset SEMANAL con el que se calcula el Hedge Ratio de arriba (para auditar)"):
             crudo = df_norm[df_norm["Ticker"].isin(obj2_tickers)][["Date", "Ticker", "Paridad", "TIR", "MD"]]
             piv_paridad = crudo.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first")
             piv_tir = crudo.pivot_table(index="Date", columns="Ticker", values="TIR", aggfunc="first")
@@ -1527,8 +1554,9 @@ with tab_bench:
                        "D31M7 y D30S6 (lo que alimenta el Hedge Ratio de arriba). Si un Paridad_ viene vacío, "
                        "es porque ese ticker no cotizó (o no existía) esa semana en el dataset.")
             csv_auditoria = auditoria.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Descargar dataset de auditoría (CSV)", data=csv_auditoria,
-                                file_name=f"auditoria_hedge_obj2_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
+            st.download_button("⬇️ Descargar dataset SEMANAL de auditoría (CSV)", data=csv_auditoria,
+                                file_name=f"auditoria_hedge_semanal_obj2_{as_of_hoy.strftime('%Y%m%d')}.csv",
+                                mime="text/csv", key="dl_auditoria_semanal")
 
         st.markdown("**Cartera Total · Cobertura de las necesidades en USD del cronograma del préstamo**")
         fecha_desembolso_ts = pd.Timestamp(fecha_desembolso)
