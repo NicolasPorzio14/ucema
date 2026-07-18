@@ -899,16 +899,27 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
     # Factor VT(t)/VT(compra) por indexación real, anclado en la fecha de compra:
     # en t=compra el factor es 1 (no toca compute_compra), y desde ahí incorpora
     # la devaluación/CER REAL — lo que la Paridad sola no captura.
+    # Registra los instrumentos INDEXADOS (FX/CER) a los que NO se les pudo
+    # aplicar la indexación porque falta la serie de índice o el ancla: en esos
+    # casos el factor queda en 1.0 y el "precio en pesos" es en realidad la
+    # Paridad cruda (SIN devaluación). Eso es exactamente lo que hace que la
+    # cartera "no suba con el dólar": hay que avisarlo fuerte, no en silencio.
     factor_idx = {}
+    sin_indexar = []  # [(ticker, tipo, motivo)]
     for tk in bonos:
         tipo = IND_TICKER.get(tk, "ARS")
-        indice = _indice_diario(tipo, fx_diario, cer_diario)
-        if tipo == "ARS" or indice.empty:
+        if tipo == "ARS":
             factor_idx[tk] = pd.Series(1.0, index=idx_union)
+            continue
+        indice = _indice_diario(tipo, fx_diario, cer_diario)
+        if indice.empty:
+            factor_idx[tk] = pd.Series(1.0, index=idx_union)
+            sin_indexar.append((tk, tipo, "sin serie de índice (A3500/CER no disponible)"))
             continue
         ind_ff = indice.reindex(pd.DatetimeIndex(sorted(set(indice.index) | set(idx_union)))).ffill().reindex(idx_union)
         if fecha_compra not in ind_ff.index or pd.isna(ind_ff.loc[fecha_compra]):
             factor_idx[tk] = pd.Series(1.0, index=idx_union)
+            sin_indexar.append((tk, tipo, "sin índice en la fecha de ancla (compra)"))
         else:
             factor_idx[tk] = ind_ff / ind_ff.loc[fecha_compra]
 
@@ -963,6 +974,7 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
     out["Estado"] = np.select(
         [out["Date"] == fecha_compra, out["Date"] == as_of_hoy, out["Date"] > as_of_hoy],
         ["Compra", "Hoy", "Proyectado"], default="Realizado")
+    out.attrs["sin_indexar"] = sin_indexar
     return out
 
 
@@ -1142,6 +1154,7 @@ else:
 # ---------------------------------------------------------------------
 fx_diario = None
 cer_diario = None
+df_bench_diario = pd.DataFrame()
 
 if not data_ok:
     st.warning("⚠️ Sin datos de mercado del dataset principal (ONs/Bonos/Soberanos): las pestañas "
@@ -1171,6 +1184,13 @@ else:
         fx_diario = _bf.dropna(subset=["A3500"]).set_index("Date")["A3500"]
     if not _bf.empty and "CER" in _bf.columns:
         cer_diario = _bf.dropna(subset=["CER"]).set_index("Date")["CER"]
+    # Se guarda la MISMA serie A3500/CER para que la pestaña de benchmark use
+    # exactamente el índice que alimentó la valuación de la cartera. Antes el
+    # benchmark volvía a descargar A3500 con un rango distinto (y otra entrada de
+    # caché): un corte transitorio del BCRA podía dejar la cartera SIN indexar
+    # (parecía caer) mientras el índice A3500 del gráfico se veía perfecto —
+    # justo la inconsistencia "el índice sube pero la cartera baja".
+    df_bench_diario = _bf
 
     snap_hoy = build_holdings_snapshot(port_df, df_norm, as_of_hoy)
     kpis_hoy = portfolio_kpis(snap_hoy)
@@ -1212,6 +1232,18 @@ with tab_hoy:
         st.caption(f"Snapshot al {as_of_hoy.strftime('%d/%m/%Y')}" + (" (datos de ejemplo)" if modo_demo else "") +
                    f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')} · El 'Valor actual' incorpora la "
                    f"indexación real (FX/CER) de los instrumentos, no solo la Paridad.")
+
+        _sin_idx = semanal.attrs.get("sin_indexar", []) if isinstance(semanal, pd.DataFrame) else []
+        if _sin_idx:
+            _peso_sin_idx = port_df.loc[port_df["Ticker"].isin([t for t, _, _ in _sin_idx]), "Peso_pct"].sum()
+            _det = " · ".join(f"{t} ({tipo}: {motivo})" for t, tipo, motivo in _sin_idx)
+            st.error(
+                f"⚠️ **El 'Valor actual' NO refleja la devaluación para {_peso_sin_idx:.1f}% de la cartera.** "
+                f"A estos instrumentos indexados no se les pudo aplicar la indexación y quedaron valuados a "
+                f"su Paridad cruda (que se mueve poco aunque el dólar suba): **{_det}**. Por eso la cartera "
+                f"puede parecer que 'no sube con el dólar' o que cae en pesos: es un dato faltante de A3500/CER, "
+                f"no un resultado financiero real. Reintentá con la API del BCRA disponible (botón "
+                f"'Refrescar datos') o revisá la conexión / modo de ejemplo.")
 
         st.divider()
         p1, p2, p3 = st.columns(3)
@@ -1313,7 +1345,14 @@ with tab_sim:
         if sin_precio:
             st.warning(f"Sin precio de mercado en la fecha de compra para: **{', '.join(sin_precio)}** — "
                        f"no se pueden calcular sus nominales y quedan afuera de la simulación.")
-        if fx_diario is None:
+        _sin_idx_sim = semanal.attrs.get("sin_indexar", []) if isinstance(semanal, pd.DataFrame) else []
+        if _sin_idx_sim:
+            _peso_si = port_df.loc[port_df["Ticker"].isin([t for t, _, _ in _sin_idx_sim]), "Peso_pct"].sum()
+            _det_si = " · ".join(f"{t} ({tipo}: {motivo})" for t, tipo, motivo in _sin_idx_sim)
+            st.error(f"⚠️ **{_peso_si:.1f}% de la cartera quedó SIN indexar** (valuado a Paridad cruda, sin "
+                     f"devaluación): **{_det_si}**. La curva en pesos de abajo subestima el valor real "
+                     f"mientras falte ese dato. No es que la cobertura no funcione: falta la serie de índice.")
+        elif fx_diario is None:
             st.warning("No hay serie de A3500 disponible: los Dollar-Linked se muestran sin ajuste de "
                        "indexación (equivale a la Paridad cruda). Revisá la conexión al BCRA / modo demo.")
 
@@ -1387,7 +1426,18 @@ with tab_bench:
             df_shy = df_bench_raw[["Date", "SHY"]].rename(columns={"SHY": "Valor"})
             df_bench_bcra = df_bench_raw[["Date", "A3500", "CER"]]
         else:
-            df_bench_bcra = fetch_benchmark_bcra(desde_bm.strftime("%Y-%m-%d"), hasta_bm.strftime("%Y-%m-%d"))
+            # Reusa la MISMA serie A3500/CER que valuó la cartera (df_bench_diario),
+            # en vez de re-descargarla con otro rango. Así el A3500 del gráfico y el
+            # que indexó la cartera son siempre idénticos: no puede pasar que el
+            # índice suba y la cartera no. Solo se descarga de nuevo si por algún
+            # motivo aquella serie vino vacía.
+            if df_bench_diario is not None and not df_bench_diario.empty:
+                df_bench_bcra = df_bench_diario[
+                    [c for c in ["Date", "A3500", "CER"] if c in df_bench_diario.columns]].copy()
+                df_bench_bcra = df_bench_bcra[(df_bench_bcra["Date"] >= desde_bm) &
+                                              (df_bench_bcra["Date"] <= hasta_bm)]
+            else:
+                df_bench_bcra = fetch_benchmark_bcra(desde_bm.strftime("%Y-%m-%d"), hasta_bm.strftime("%Y-%m-%d"))
             df_shy = fetch_shy_series(desde_bm.strftime("%Y-%m-%d"), hasta_bm.strftime("%Y-%m-%d"))
             if df_shy.empty:
                 st.warning("No se pudo descargar SHY de Yahoo Finance (puede ser un bloqueo temporal del "
