@@ -695,24 +695,33 @@ with tab_hoy:
         fig = px.pie(g, names="Objetivo", values="Peso_pct", hole=0.45,
                      color="Objetivo", color_discrete_map={
                          "1 · Capital de Trabajo": COLORS["obj1"], "2 · Cobertura FX Préstamo": COLORS["obj2"]})
-        fig.update_traces(textinfo="label+percent", textposition="outside")
+        fig.update_traces(textinfo="label+percent", textposition="outside",
+                           textfont=dict(color="white", size=12),
+                           outsidetextfont=dict(color="white", size=12))
         fig.update_layout(title="Por Objetivo", showlegend=False, height=380, **PLOTLY_LAYOUT)
+        fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
         st.plotly_chart(fig, use_container_width=True)
 
     with p2:
         g = snap_hoy.groupby("Tramo")["Peso_pct"].sum().reset_index()
         fig = px.pie(g, names="Tramo", values="Peso_pct", hole=0.45)
         fig.update_traces(textinfo="label+percent", textposition="outside",
-                           marker=dict(colors=px.colors.qualitative.Safe))
+                           marker=dict(colors=px.colors.qualitative.Safe),
+                           textfont=dict(color="white", size=12),
+                           outsidetextfont=dict(color="white", size=12))
         fig.update_layout(title="Por Tramo", showlegend=False, height=380, **PLOTLY_LAYOUT)
+        fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
         st.plotly_chart(fig, use_container_width=True)
 
     with p3:
         g = snap_hoy.groupby("Ticker")["Peso_pct"].sum().reset_index()
         fig = px.pie(g, names="Ticker", values="Peso_pct", hole=0.45)
         fig.update_traces(textinfo="label+percent", textposition="outside",
-                           marker=dict(colors=px.colors.qualitative.Set2))
+                           marker=dict(colors=px.colors.qualitative.Set2),
+                           textfont=dict(color="white", size=12),
+                           outsidetextfont=dict(color="white", size=12))
         fig.update_layout(title="Por Instrumento", showlegend=False, height=380, **PLOTLY_LAYOUT)
+        fig.update_layout(title_font=dict(color="white"), font=dict(color="white"))
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
