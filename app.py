@@ -109,6 +109,13 @@ IND_TICKER = {
     "S31L6": "ARS",                                # LECAP: sin indexación, la Paridad ya es precio
 }
 
+# Movimiento mínimo del A3500 en la ventana para que el HEDGE RATIO medido como
+# COCIENTE de retornos acumulados (retorno_bono / devaluación) sea interpretable.
+# Por debajo de esto el denominador es casi cero y el cociente explota (da 150%,
+# 300%, negativo…) sin significado económico: ahí se usa la beta y la correlación,
+# no el cociente.
+HEDGE_MIN_FX_MOVE = 0.02  # 2%
+
 COLORS = {
     "primary": "#1f2a44",
     "accent": "#c8963e",
@@ -592,14 +599,17 @@ def hedge_ratio_directo(precio_activo: pd.Series, precio_bench: pd.Series) -> di
 
     ret_activo = a.iloc[-1] / a.iloc[0] - 1
     ret_bench = b_ventana.iloc[-1] / b_ventana.iloc[0] - 1
-    hr = (ret_activo / ret_bench * 100) if abs(ret_bench) > 1e-6 else np.nan
+    # Guarda: el cociente de retornos acumulados explota cuando el dólar se movió
+    # poco en la ventana (denominador ~0). Solo se reporta como % si el A3500 se
+    # movió al menos HEDGE_MIN_FX_MOVE; si no, no es interpretable → se usa la beta.
+    hr = (ret_activo / ret_bench * 100) if abs(ret_bench) >= HEDGE_MIN_FX_MOVE else np.nan
 
     ret_activo_serie = a.pct_change()
     b_alineado = b.reindex(a.index).pct_change()
-    common = pd.concat([ret_activo_serie, b_alineado], axis=1).dropna()
-    corr = common.iloc[:, 0].corr(common.iloc[:, 1]) if len(common) >= 3 else np.nan
+    hb = hedge_beta(ret_activo_serie, b_alineado)
 
-    return dict(n=len(a), hedge_ratio=hr, corr=corr, desde=desde, hasta=hasta)
+    return dict(n=len(a), hedge_ratio=hr, beta=hb["beta"], corr=hb["corr"],
+                fx_move=ret_bench, desde=desde, hasta=hasta)
 
 
 def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
@@ -694,6 +704,32 @@ def sortino_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int =
     if pd.isna(dd) or dd < 1e-10:
         return np.nan
     return float(excess.mean() / dd * np.sqrt(periods_per_year))
+
+
+def hedge_beta(ret_activo: pd.Series, ret_bench: pd.Series) -> dict:
+    """Hedge Ratio ROBUSTO = pendiente (beta) de la regresión de los retornos EN
+    PESOS del activo sobre los retornos del A3500:  beta = cov(activo, A3500) / var(A3500).
+
+    Es la definición de manual del hedge ratio 'dollar-offset' (de mínima varianza):
+      · beta ≈ 1  → el activo se mueve 1:1 con el dólar (cobertura perfecta).
+      · beta > 1  → amplifica la devaluación (capta además spread propio del DL).
+      · beta < 1  → amortigua (queda por detrás del dólar).
+
+    A diferencia del cociente de retornos ACUMULADOS punta a punta, la beta usa
+    TODA la nube de puntos (no solo el primero y el último) y NO explota cuando el
+    dólar se movió poco en la ventana. Devuelve también R² y correlación."""
+    df = pd.concat([ret_activo, ret_bench], axis=1).dropna()
+    df = df[np.isfinite(df).all(axis=1)]
+    if len(df) < 3:
+        return dict(beta=np.nan, r2=np.nan, corr=np.nan, n=len(df))
+    y = df.iloc[:, 0].to_numpy(dtype=float)
+    x = df.iloc[:, 1].to_numpy(dtype=float)
+    vx = float(np.var(x, ddof=1))
+    if not np.isfinite(vx) or vx < 1e-12:
+        return dict(beta=np.nan, r2=np.nan, corr=np.nan, n=len(df))
+    beta = float(np.cov(y, x, ddof=1)[0, 1] / vx)
+    corr = float(np.corrcoef(y, x)[0, 1])
+    return dict(beta=beta, r2=corr ** 2, corr=corr, n=len(df))
 
 
 def information_ratio(returns: pd.Series, benchmark: pd.Series, periods_per_year: int = 52) -> float:
@@ -1702,12 +1738,17 @@ with tab_bench:
                    "cobertura (dollar-offset), no con Sharpe/Sortino/Information Ratio.")
 
         st.markdown("**Objetivo 2 · Calidad del hedge (dollar-offset)**")
-        st.info("✅ **Cálculo corregido.** El Hedge Ratio ahora compara el **precio en pesos** del "
-                "instrumento (Paridad × A3500/A3500(ancla)) contra la devaluación del A3500 — es decir, "
-                "mide la cobertura REAL frente al tipo de cambio. Antes usaba la Paridad sola, que le "
-                "restaba justamente la devaluación que el bono está diseñado para capturar, y por eso "
-                "daba artificialmente bajo. Un Hedge Ratio ≈100% = calza 1:1 con la devaluación; >100% = "
-                "captura además el spread propio del Dollar-Linked.")
+        st.info("🛡️ **Cómo leer el hedge ratio (y por qué la métrica principal es la β, no un %).** "
+                "El hedge ratio correcto es la **β**: la pendiente de regresión de los retornos en pesos "
+                "del bono contra los del A3500. **β ≈ 1** = el bono se mueve 1:1 con el dólar (cobertura "
+                "perfecta); **β > 1** amplifica; **β < 1** amortigua. "
+                "El otro número, la **'captura acumulada' (%)**, es el cociente de los retornos ACUMULADOS "
+                "punta a punta y **hay que leerlo con cuidado**: cuando el dólar se movió poco en la "
+                "ventana, su denominador es casi cero y el cociente **explota** (da 150%, 300%, negativo…) "
+                "sin significado — por eso arriba de +2% de movimiento del dólar se muestra y si no aparece "
+                "'N/D'. Además la captura mezcla *cobertura* con *apreciación de precio* del bono, así que "
+                "un 150% NO significa 'cobertura 150% efectiva'. Para juzgar la cobertura, mirá la **β y la "
+                "correlación**.")
 
         primeras_fechas_obj2 = primer_dato_disponible(df_norm, obj2_tickers)
         txt_primeras = " · ".join(
@@ -1733,16 +1774,19 @@ with tab_bench:
             if len(validos_tk) >= 3:
                 cum_tk = (1 + validos_tk["ret"]).cumprod().iloc[-1] - 1
                 cum_a3500_tk = (1 + validos_tk["ret_A3500"].fillna(0)).cumprod().iloc[-1] - 1
-                hr_tk = (cum_tk / cum_a3500_tk * 100) if abs(cum_a3500_tk) > 1e-6 else np.nan
-                corr_tk = validos_tk["ret"].corr(validos_tk["ret_A3500"])
+                hb_tk = hedge_beta(validos_tk["ret"], validos_tk["ret_A3500"])
+                # captura acumulada con guarda: solo si el dólar se movió ≥ 2% en la ventana
+                cap_tk = (cum_tk / cum_a3500_tk * 100) if abs(cum_a3500_tk) >= HEDGE_MIN_FX_MOVE else np.nan
                 filas_por_ticker.append(dict(
                     Ticker=tk, Peso_en_cartera=peso_tk, N_semanas_propias=len(validos_tk),
                     Desde=validos_tk["Date"].iloc[0], Hasta=validos_tk["Date"].iloc[-1],
-                    Hedge_Ratio=hr_tk, Correlacion=corr_tk))
+                    Beta=hb_tk["beta"], FX_ventana_pct=cum_a3500_tk * 100,
+                    Captura_pct=cap_tk, Correlacion=hb_tk["corr"]))
             else:
                 filas_por_ticker.append(dict(
                     Ticker=tk, Peso_en_cartera=peso_tk, N_semanas_propias=len(validos_tk),
-                    Desde=None, Hasta=None, Hedge_Ratio=np.nan, Correlacion=np.nan))
+                    Desde=None, Hasta=None, Beta=np.nan, FX_ventana_pct=np.nan,
+                    Captura_pct=np.nan, Correlacion=np.nan))
         tabla_por_ticker = pd.DataFrame(filas_por_ticker)
         st.dataframe(tabla_por_ticker, use_container_width=True, hide_index=True,
                      column_config={
@@ -1750,14 +1794,17 @@ with tab_bench:
                          "N_semanas_propias": st.column_config.NumberColumn("N° semanas propias"),
                          "Desde": st.column_config.DateColumn("Desde", format="DD/MM/YYYY"),
                          "Hasta": st.column_config.DateColumn("Hasta", format="DD/MM/YYYY"),
-                         "Hedge_Ratio": st.column_config.NumberColumn("Hedge Ratio", format="%.0f%%"),
+                         "Beta": st.column_config.NumberColumn("Hedge Ratio β", format="%.2f",
+                                                               help="Pendiente de regresión vs. A3500. ≈1 = calza 1:1 con el dólar."),
+                         "FX_ventana_pct": st.column_config.NumberColumn("Δ dólar en la ventana", format="%.1f%%"),
+                         "Captura_pct": st.column_config.NumberColumn("Captura acum. (si Δdólar≥2%)", format="%.0f%%"),
                          "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
                      })
-        st.caption("Cada bono se compara contra el A3500 únicamente en las semanas donde ESE bono tiene "
-                   "precio — sin que la falta de historia de uno contamine al otro. **'Desde' = primera "
-                   "semana con retorno válido** (≈1 semana después del primer precio diario citado arriba, "
-                   "porque el primer retorno necesita una semana previa). El retorno del bono ya es en pesos "
-                   "(ajustado por FX), así que el Hedge Ratio debería rondar el 100%.")
+        st.caption("La métrica de cobertura es la **β** (≈1 = se mueve 1:1 con el dólar). La **captura "
+                   "acumulada** solo se muestra si el dólar se movió ≥2% en la ventana de ESE bono (si no, "
+                   "queda vacía: con un denominador casi cero el cociente no significa nada). **'Desde' = "
+                   "primera semana con retorno válido** (≈1 semana después del primer precio diario citado "
+                   "arriba). Cada bono se compara contra el A3500 solo en sus propias semanas con precio.")
 
         st.markdown("*Análisis diario (mismo calendario, más observaciones):*")
         fechas_reales_validas = [f for f in primeras_fechas_obj2.values() if f is not None]
@@ -1766,8 +1813,9 @@ with tab_bench:
             ticker_tope = [t for t, f in primeras_fechas_obj2.items() if f == fecha_tope_diaria][0]
             st.caption(f"No hay más calendario para pedir hacia atrás ({ticker_tope} empezó a cotizar el "
                        f"{fecha_tope_diaria.strftime('%d/%m/%Y')}), pero dentro de esas semanas se puede "
-                       f"mirar día por día. Hedge Ratio calculado **directo** (último ÷ primer precio en "
-                       f"pesos, como en Excel) — no encadenando retornos día a día.")
+                       f"mirar día por día. La **β** sale de regresión diaria; la 'captura' es el cociente "
+                       f"directo (último ÷ primer precio en pesos, como en Excel) y solo se muestra si el "
+                       f"dólar se movió ≥2% en la ventana.")
 
             if modo_demo:
                 a3500_diario_df = synthetic_benchmark_series(
@@ -1786,15 +1834,17 @@ with tab_bench:
                 m = hedge_ratio_directo(precio_tk, a3500_diario)
                 filas_diario.append(dict(
                     Ticker=tk, N_obs_diarias=m["n"],
-                    Desde=m["desde"], Hasta=m["hasta"],
-                    Hedge_Ratio=m["hedge_ratio"], Correlacion=m["corr"]))
+                    Desde=m["desde"], Hasta=m["hasta"], Beta=m["beta"],
+                    FX_ventana_pct=(m["fx_move"] * 100 if pd.notna(m.get("fx_move")) else np.nan),
+                    Captura_pct=m["hedge_ratio"], Correlacion=m["corr"]))
             indice_obj2_diario = price_index_multi(port_df, df_norm, obj2_tickers, fecha_tope_diaria, as_of_hoy,
                                                     fx_diario=a3500_diario)
             m_comb = hedge_ratio_directo(indice_obj2_diario, a3500_diario)
             filas_diario.append(dict(
                 Ticker="Objetivo 2 (combinado)", N_obs_diarias=m_comb["n"],
-                Desde=m_comb["desde"], Hasta=m_comb["hasta"],
-                Hedge_Ratio=m_comb["hedge_ratio"], Correlacion=m_comb["corr"]))
+                Desde=m_comb["desde"], Hasta=m_comb["hasta"], Beta=m_comb["beta"],
+                FX_ventana_pct=(m_comb["fx_move"] * 100 if pd.notna(m_comb.get("fx_move")) else np.nan),
+                Captura_pct=m_comb["hedge_ratio"], Correlacion=m_comb["corr"]))
 
             tabla_diaria = pd.DataFrame(filas_diario)
             st.dataframe(tabla_diaria, use_container_width=True, hide_index=True,
@@ -1802,13 +1852,17 @@ with tab_bench:
                              "N_obs_diarias": st.column_config.NumberColumn("N° obs. diarias"),
                              "Desde": st.column_config.DateColumn("Desde", format="DD/MM/YYYY"),
                              "Hasta": st.column_config.DateColumn("Hasta", format="DD/MM/YYYY"),
-                             "Hedge_Ratio": st.column_config.NumberColumn("Hedge Ratio", format="%.0f%%"),
+                             "Beta": st.column_config.NumberColumn("Hedge Ratio β", format="%.2f",
+                                                                   help="Pendiente de regresión vs. A3500. ≈1 = calza 1:1 con el dólar."),
+                             "FX_ventana_pct": st.column_config.NumberColumn("Δ dólar en la ventana", format="%.1f%%"),
+                             "Captura_pct": st.column_config.NumberColumn("Captura acum. (si Δdólar≥2%)", format="%.0f%%"),
                              "Correlacion": st.column_config.NumberColumn("Correlación", format="%.2f"),
                          })
             if not tabla_diaria.empty and tabla_diaria["N_obs_diarias"].notna().any():
                 st.caption(f"Máximo de observaciones diarias por ticker: "
-                           f"{int(tabla_diaria['N_obs_diarias'].max())}. Al ser precio en pesos ya "
-                           f"ajustado por FX, el Hedge Ratio combinado debería quedar cerca de 100%.")
+                           f"{int(tabla_diaria['N_obs_diarias'].max())}. La cobertura se juzga con la **β** "
+                           f"(≈1 = calza 1:1 con el dólar); la captura acumulada solo aparece si el dólar se "
+                           f"movió ≥2% en la ventana (si no, el cociente no es interpretable).")
 
             with st.expander("🔍 Ver el dataset DIARIO con el que se calcula esta tabla (para auditar)"):
                 crudo_d = df_norm[(df_norm["Ticker"].isin(obj2_tickers)) & (df_norm["Date"] >= fecha_tope_diaria) &
@@ -1864,19 +1918,32 @@ with tab_bench:
             cum_a3500 = (1 + validos_obj2["ret_A3500"].fillna(0)).cumprod()
             ret_obj2_cum = cum_obj2.iloc[-1] - 1
             ret_a3500_cum = cum_a3500.iloc[-1] - 1
-            hedge_ratio = (ret_obj2_cum / ret_a3500_cum * 100) if abs(ret_a3500_cum) > 1e-6 else np.nan
-            corr_obj2_a3500 = validos_obj2["ret"].corr(validos_obj2["ret_A3500"])
-            h1, h2, h3 = st.columns(3)
-            h1.metric("Hedge Ratio (dollar-offset)", f"{hedge_ratio:.0f}%" if pd.notna(hedge_ratio) else "—",
-                      "100% = calzó 1:1 con la devaluación")
-            h2.metric("Correlación semanal vs. A3500", f"{corr_obj2_a3500:.2f}" if pd.notna(corr_obj2_a3500) else "—")
-            h3.metric("N° semanas usadas", f"{n_semanas_hedge}")
-            st.caption(f"Hedge Ratio = retorno acumulado EN PESOS de Objetivo 2 ÷ devaluación acumulada de "
-                       f"A3500, sobre el mismo período con dato real: "
-                       f"{fecha_ini_valida.strftime('%d/%m/%Y')} → {fecha_fin_valida.strftime('%d/%m/%Y')} "
-                       f"({n_semanas_hedge} semanas). El retorno de Objetivo 2 ya incorpora la "
-                       f"indexación por FX, así que ≈100% confirma que la cobertura funciona; >100% = "
-                       f"además capturó el spread propio de los DL; <100% = quedó por detrás.")
+            # Métrica PRINCIPAL: beta de regresión (robusta). El cociente de retornos
+            # acumulados ('captura') queda como secundario y con guarda: si el dólar
+            # se movió < 2% en la ventana, el cociente no es interpretable.
+            hb_obj2 = hedge_beta(validos_obj2["ret"], validos_obj2["ret_A3500"])
+            captura = (ret_obj2_cum / ret_a3500_cum * 100) if abs(ret_a3500_cum) >= HEDGE_MIN_FX_MOVE else np.nan
+            corr_obj2_a3500 = hb_obj2["corr"]
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Hedge Ratio (β dollar-offset)", f"{hb_obj2['beta']:.2f}" if pd.notna(hb_obj2['beta']) else "—",
+                      "1,00 = se mueve 1:1 con el dólar")
+            h2.metric("Captura acumulada", f"{captura:.0f}%" if pd.notna(captura) else "N/D",
+                      f"dólar {ret_a3500_cum*100:+.1f}% en la ventana")
+            h3.metric("Correlación semanal vs. A3500", f"{corr_obj2_a3500:.2f}" if pd.notna(corr_obj2_a3500) else "—")
+            h4.metric("N° semanas usadas", f"{n_semanas_hedge}")
+            _txt_captura = (f"**Captura acumulada = {captura:.0f}%** (retorno en pesos de Obj.2 ÷ devaluación "
+                            f"del A3500, punta a punta)." if pd.notna(captura)
+                            else f"**Captura acumulada = N/D**: el A3500 se movió solo {ret_a3500_cum*100:+.1f}% "
+                                 f"en la ventana (< 2%), así que ese cociente no es interpretable — con un "
+                                 f"denominador casi cero da valores absurdos (150%, 300%…).")
+            st.caption(f"**Hedge Ratio (β) = {hb_obj2['beta']:.2f}** es la métrica correcta de cobertura: la "
+                       f"pendiente de regresión de los retornos semanales de Obj.2 (en pesos) contra los del "
+                       f"A3500, sobre {fecha_ini_valida.strftime('%d/%m/%Y')} → "
+                       f"{fecha_fin_valida.strftime('%d/%m/%Y')} ({n_semanas_hedge} semanas). β ≈ 1 = calza "
+                       f"1:1 con el dólar; β > 1 = amplifica; β < 1 = amortigua. Usa TODA la nube de puntos, "
+                       f"por eso NO explota cuando el dólar se movió poco. {_txt_captura} Ojo: la 'captura' "
+                       f"mezcla cobertura (moverse con el dólar) con apreciación de precio del bono, y por eso "
+                       f"puede dar 150%+ sin que la cobertura sea '150% efectiva' — para eso mirá la β.")
         else:
             st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
                        f"muy poco para que el Hedge Ratio o la correlación signifiquen algo.")
@@ -2131,11 +2198,15 @@ with tab_metodo:
     ponderados por el peso real de Tramo 1/2 y Tramo 3; el de Objetivo 2 es 100% A3500; el de la Cartera
     Total pondera ambos — misma estructura que "Medición de Desempeño" del IPS.
 
-    **Efectividad de cobertura (Hedge Ratio, dollar-offset):** compara el **retorno en pesos** de
-    Objetivo 2 (ya ajustado por FX) contra la devaluación del A3500 sobre el mismo período con dato
-    real. ≈100% = la cobertura calzó 1:1 con la devaluación; >100% = capturó además el spread del DL;
-    <100% = quedó por detrás. Al medirse sobre el precio en pesos (y no sobre la Paridad), este número
-    ahora refleja la cobertura real.
+    **Efectividad de cobertura (Hedge Ratio, dollar-offset):** la métrica principal es la **β** = la
+    pendiente de regresión de los retornos EN PESOS de Objetivo 2 (ya ajustados por FX) contra los
+    retornos del A3500. **β ≈ 1** = se mueve 1:1 con el dólar (cobertura perfecta); **β > 1** amplifica;
+    **β < 1** amortigua. Se usa la β (regresión sobre toda la muestra) y NO el cociente de retornos
+    acumulados punta a punta, porque ese cociente **explota cuando el dólar se movió poco en la ventana**
+    (denominador ≈ 0 → valores como 150%, 300% o negativos sin sentido). Ese cociente se muestra aparte
+    como *'captura acumulada'*, y solo si el A3500 se movió al menos un 2% en la ventana; además la
+    captura mezcla cobertura con apreciación de precio del bono, así que un 150% no significa "cobertura
+    150% efectiva". La correlación acompaña como medida de qué tan estable es el calce semana a semana.
 
     **Ratios de riesgo-retorno (Objetivo 1):** Sharpe y Sortino se calculan sobre retornos en pesos,
     **restando** la tasa libre de riesgo en pesos (la TNA de la caución / money market llevada a base
