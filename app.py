@@ -461,6 +461,18 @@ def _align_to_dates(df_diario: pd.DataFrame, fechas: pd.DatetimeIndex, cols: lis
     return d.reindex(fechas)[cols].reset_index().rename(columns={"index": "Date"})
 
 
+def primer_dato_disponible(df_norm: pd.DataFrame, tickers: list) -> dict:
+    """Primera fecha con Paridad no nula para cada ticker, en TODO el dataset
+    (sin recortar por ninguna ventana) — para diagnosticar si un ticker joven
+    (ej. un DL recién emitido) realmente no tiene más historia disponible, en
+    vez de asumir que 'pedir más semanas' siempre destraba más datos."""
+    out = {}
+    for t in tickers:
+        d = df_norm[(df_norm["Ticker"] == t) & df_norm["Paridad"].notna()]
+        out[t] = d["Date"].min() if not d.empty else None
+    return out
+
+
 def build_benchmark_table(port_df: pd.DataFrame, fechas: pd.DatetimeIndex,
                            df_bcra_bench: pd.DataFrame, df_shy: pd.DataFrame) -> tuple:
     """Arma, sobre la MISMA grilla semanal de la simulación de cartera, los
@@ -1281,6 +1293,15 @@ with tab_bench:
                    "cobertura, no con Sharpe/Sortino/Information Ratio.")
 
         st.markdown("**Objetivo 2 · Calidad del hedge (dollar-offset)**")
+
+        primeras_fechas_obj2 = primer_dato_disponible(df_norm, obj2_tickers)
+        txt_primeras = " · ".join(
+            f"{t}: {f.strftime('%d/%m/%Y') if f is not None else 'sin dato en el dataset'}"
+            for t, f in primeras_fechas_obj2.items())
+        st.caption(f"📅 Primera fecha con precio disponible en el dataset (sin importar la ventana elegida "
+                   f"arriba) — {txt_primeras}. Si estas fechas son recientes, ampliar la ventana no agrega "
+                   f"más historia: **el dataset directamente no tiene más** (instrumentos jóvenes).")
+
         ext_ret_obj2, ext_faltan_obj2, _ = extended_weekly_returns(
             port_df, df_norm, obj2_tickers, as_of_hoy, semanas_ext)
         merged_obj2 = ext_ret_obj2.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
@@ -1312,19 +1333,52 @@ with tab_bench:
             st.caption(f"Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, "
                        f"ambos calculados sobre el **mismo período con dato real**: "
                        f"{fecha_ini_valida.strftime('%d/%m/%Y')} → {fecha_fin_valida.strftime('%d/%m/%Y')} "
-                       f"({n_semanas_hedge} semanas — puede ser más corto que la ventana elegida arriba si "
-                       f"D31M7/D30S6 no tienen historia en todo ese rango, algo esperable en instrumentos "
-                       f"jóvenes). >100%: la cobertura rindió por encima de la pura devaluación (spread "
-                       f"propio de los DL). <100%: quedó por detrás. La correlación debería ser fuertemente "
-                       f"positiva si el hedge funciona bien.")
+                       f"({n_semanas_hedge} semanas). >100%: la cobertura rindió por encima de la pura "
+                       f"devaluación (spread propio de los DL). <100%: quedó por detrás.")
+
+            st.warning(
+                "⚠️ **Posible límite metodológico, no solo de muestra.** Este cálculo usa la *Paridad* "
+                "(Precio de mercado ÷ Valor Técnico) de Alphacast. Para un bono indexado (Dollar-Linked o "
+                "CER), el **Valor Técnico ya incorpora la indexación** (crece con la devaluación o la "
+                "inflación) — si la Paridad se mantiene relativamente estable, el bono puede estar "
+                "devengando esa indexación *perfectamente* sin que se note en el retorno que estoy "
+                "calculando acá (que solo mide la Paridad, no el Valor Técnico). En otras palabras: **un "
+                "Hedge Ratio bajo acá no prueba necesariamente que la cobertura esté fallando** — puede "
+                "ser que el cálculo le esté restando al DL su propio devengamiento por tipo de cambio. "
+                "No tengo forma de confirmar esto sin acceso a Valor Técnico o Precio pleno del dataset — "
+                "quedás mejor posicionado que yo para chequearlo con la mesa o soporte de Alphacast. "
+                "Mientras tanto, usá la tabla de abajo para auditar dato por dato.")
         else:
             st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
-                       f"muy poco para que el Hedge Ratio o la correlación signifiquen algo. Probá ampliar "
-                       f"la ventana arriba (D31M7/D30S6 son instrumentos jóvenes: puede que el dataset "
-                       f"tampoco tenga mucha más historia disponible).")
+                       f"muy poco para que el Hedge Ratio o la correlación signifiquen algo.")
         if ext_faltan_obj2:
             st.caption(f"Sin ninguna historia en el dataset para: **{', '.join(ext_faltan_obj2)}** dentro "
                        f"de la ventana elegida.")
+
+        with st.expander("🔍 Ver el dataset con el que se calcula este Hedge Ratio (para auditar)"):
+            crudo = df_norm[df_norm["Ticker"].isin(obj2_tickers)][["Date", "Ticker", "Paridad", "TIR", "MD"]]
+            piv_paridad = crudo.pivot_table(index="Date", columns="Ticker", values="Paridad", aggfunc="first")
+            piv_tir = crudo.pivot_table(index="Date", columns="Ticker", values="TIR", aggfunc="first")
+            piv_paridad.columns = [f"Paridad_{c}" for c in piv_paridad.columns]
+            piv_tir.columns = [f"TIR_{c}" for c in piv_tir.columns]
+            auditoria = merged_obj2[["Date", "ret", "A3500", "ret_A3500"]].rename(
+                columns={"ret": "Retorno_Obj2_ponderado", "ret_A3500": "Retorno_A3500"})
+            auditoria = auditoria.merge(piv_paridad.reset_index(), on="Date", how="left")
+            auditoria = auditoria.merge(piv_tir.reset_index(), on="Date", how="left")
+            st.dataframe(auditoria.sort_values("Date"), use_container_width=True, height=320,
+                         column_config={
+                             "Retorno_Obj2_ponderado": st.column_config.NumberColumn("Retorno Obj.2 (ponderado)", format="%.3f%%"),
+                             "A3500": st.column_config.NumberColumn("A3500", format="%.1f"),
+                             "Retorno_A3500": st.column_config.NumberColumn("Retorno A3500", format="%.3f%%"),
+                         })
+            st.caption("Filas = todas las fechas semanales de la ventana elegida (columna Date). "
+                       "Paridad_/TIR_ = dato crudo de Alphacast por ticker, sin transformar. "
+                       "Retorno Obj.2 (ponderado) = el retorno semanal ya combinado por peso relativo entre "
+                       "D31M7 y D30S6 (lo que alimenta el Hedge Ratio de arriba). Si un Paridad_ viene vacío, "
+                       "es porque ese ticker no cotizó (o no existía) esa semana en el dataset.")
+            csv_auditoria = auditoria.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Descargar dataset de auditoría (CSV)", data=csv_auditoria,
+                                file_name=f"auditoria_hedge_obj2_{as_of_hoy.strftime('%Y%m%d')}.csv", mime="text/csv")
 
         st.markdown("**Cartera Total · Cobertura de las necesidades en USD del cronograma del préstamo**")
         fecha_desembolso_ts = pd.Timestamp(fecha_desembolso)
