@@ -1287,26 +1287,36 @@ with tab_bench:
         merged_obj2["ret_A3500"] = merged_obj2["A3500"].pct_change()
         n_semanas_hedge = int(merged_obj2["ret"].notna().sum())
 
+        # IMPORTANTE: acumular ambas series (Objetivo 2 y A3500) sobre el MISMO
+        # sub-período con dato real de Objetivo 2 — nunca completar con 0% los
+        # huecos de un lado y no del otro. Rellenar con 0 solo la cartera (porque
+        # D31M7/D30S6 son instrumentos jóvenes y no tienen historia en todo el
+        # rango pedido) mientras el A3500 sí acumula devaluación en esas mismas
+        # semanas "vacías" infla artificialmente la devaluación del denominador
+        # y hunde el Hedge Ratio, aunque la cobertura esté funcionando bien.
         validos_obj2 = merged_obj2.dropna(subset=["ret"])
         if len(validos_obj2) >= 8:
-            cum_obj2 = (1 + merged_obj2["ret"].fillna(0)).cumprod()
-            cum_a3500 = (1 + merged_obj2["ret_A3500"].fillna(0)).cumprod()
+            fecha_ini_valida = validos_obj2["Date"].iloc[0]
+            fecha_fin_valida = validos_obj2["Date"].iloc[-1]
+            cum_obj2 = (1 + validos_obj2["ret"]).cumprod()
+            cum_a3500 = (1 + validos_obj2["ret_A3500"].fillna(0)).cumprod()
             ret_obj2_cum = cum_obj2.iloc[-1] - 1
             ret_a3500_cum = cum_a3500.iloc[-1] - 1
             hedge_ratio = (ret_obj2_cum / ret_a3500_cum * 100) if abs(ret_a3500_cum) > 1e-6 else np.nan
-            corr_obj2_a3500 = merged_obj2["ret"].corr(merged_obj2["ret_A3500"])
+            corr_obj2_a3500 = validos_obj2["ret"].corr(validos_obj2["ret_A3500"])
             h1, h2, h3 = st.columns(3)
             h1.metric("Hedge Ratio (dollar-offset)", f"{hedge_ratio:.0f}%" if pd.notna(hedge_ratio) else "—",
                       "100% = calzó 1:1 con la devaluación")
             h2.metric("Correlación semanal vs. A3500", f"{corr_obj2_a3500:.2f}" if pd.notna(corr_obj2_a3500) else "—")
             h3.metric("N° semanas usadas", f"{n_semanas_hedge}")
-            st.caption(f"Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, en "
-                       f"la misma ventana extendida de arriba ({fecha_inicio_ext.strftime('%d/%m/%Y')} → "
-                       f"{as_of_hoy.strftime('%d/%m/%Y')}, no solo las semanas realizadas desde la compra). "
-                       f">100%: la cobertura rindió por encima de la pura devaluación (spread propio de los "
-                       f"DL). <100%: quedó por detrás. La correlación debería ser fuertemente positiva si "
-                       f"el hedge funciona bien — si sale negativa o errática con pocas semanas, es señal "
-                       f"de que la muestra todavía es chica, no de que la cobertura esté fallando.")
+            st.caption(f"Hedge Ratio = retorno acumulado de Objetivo 2 ÷ devaluación acumulada de A3500, "
+                       f"ambos calculados sobre el **mismo período con dato real**: "
+                       f"{fecha_ini_valida.strftime('%d/%m/%Y')} → {fecha_fin_valida.strftime('%d/%m/%Y')} "
+                       f"({n_semanas_hedge} semanas — puede ser más corto que la ventana elegida arriba si "
+                       f"D31M7/D30S6 no tienen historia en todo ese rango, algo esperable en instrumentos "
+                       f"jóvenes). >100%: la cobertura rindió por encima de la pura devaluación (spread "
+                       f"propio de los DL). <100%: quedó por detrás. La correlación debería ser fuertemente "
+                       f"positiva si el hedge funciona bien.")
         else:
             st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
                        f"muy poco para que el Hedge Ratio o la correlación signifiquen algo. Probá ampliar "
