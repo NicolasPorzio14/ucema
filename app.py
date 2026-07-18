@@ -273,11 +273,27 @@ def normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
     if "Paridad" in df.columns:
         df["Paridad"] = pd.to_numeric(df["Paridad"], errors="coerce")
 
+    # COTIZACIÓN / PRECIO de mercado, si el dataset la trae. La Paridad NO es el
+    # precio: Paridad = Precio ÷ Valor Técnico. Si hay una columna de precio real,
+    # TODO el motor la usa directamente (es exacta) en vez de reconstruir el precio
+    # desde la Paridad × índice (que es un supuesto). Se buscan nombres habituales.
+    _price_keys = ("price", "precio", "clean price", "dirty price", "cleanprice",
+                   "market price", "precio de mercado", "last price", "last", "close",
+                   "cierre", "cotización", "cotizacion", "quote", "px")
+    _price_col = next((c for c in df.columns if str(c).strip().lower() in _price_keys), None)
+    if _price_col is not None:
+        df["Precio"] = pd.to_numeric(df[_price_col], errors="coerce")
+        df.attrs["price_col_detectada"] = str(_price_col)
+    df.attrs["columnas_crudas"] = list(df.columns)
+
     wanted = ["Date", "Ticker", "Emisor", "Segmento", "CouponStructure",
-              "IssueCcy", "TradingCcy", "TIR", "MD", "Convexidad", "Paridad", "Volumen"]
-    df = df[[c for c in wanted if c in df.columns]].copy()
-    df["Clase"] = df.get("CouponStructure", pd.Series(dtype=str)).map(COUPON_TO_CLASE).fillna("Otro")
-    return df
+              "IssueCcy", "TradingCcy", "TIR", "MD", "Convexidad", "Paridad", "Precio", "Volumen"]
+    keep = [c for c in wanted if c in df.columns]
+    out = df[keep].copy()
+    out.attrs["price_col_detectada"] = df.attrs.get("price_col_detectada")
+    out.attrs["columnas_crudas"] = df.attrs.get("columnas_crudas")
+    out["Clase"] = out.get("CouponStructure", pd.Series(dtype=str)).map(COUPON_TO_CLASE).fillna("Otro")
+    return out
 
 
 def snapshot_asof(df_norm: pd.DataFrame, tickers: list, as_of: pd.Timestamp) -> pd.DataFrame:
@@ -509,6 +525,51 @@ def _indice_diario(tipo: str, fx_diario: pd.Series, cer_diario: pd.Series) -> pd
     return pd.Series(dtype=float)
 
 
+def _ccy_es_usd(ccy) -> bool:
+    """True si la moneda de negociación es dólares (el precio hay que pasarlo a
+    pesos con el A3500). Los Dollar-Linked cotizan en ARS → su precio YA está en
+    pesos y no se convierte."""
+    if not isinstance(ccy, str):
+        return False
+    c = ccy.strip().lower()
+    return ("usd" in c) or ("u$s" in c) or ("dólar" in c) or ("dolar" in c) or c in ("us$", "d", "usdc")
+
+
+def real_peso_price_series(df_norm: pd.DataFrame, ticker: str, fx_diario: pd.Series,
+                            fecha_inicio: pd.Timestamp = None, fecha_fin: pd.Timestamp = None):
+    """PRECIO EN PESOS a partir de la COTIZACIÓN REAL del dataset (columna 'Precio'),
+    NO de la Paridad. Es exacto: no asume nada sobre el Valor Técnico.
+
+      · Si el bono cotiza en ARS (Dollar-Linked, CER, LECAP) → el precio ya está en
+        pesos e incorpora la devaluación / indexación por sí solo. Se usa tal cual.
+      · Si cotiza en USD (Hard-Dollar) → se pasa a pesos con el A3500 del día.
+
+    Devuelve None si el dataset no trae columna de precio o el ticker no tiene
+    cotización (ahí el llamador cae a la reconstrucción por Paridad)."""
+    if "Precio" not in df_norm.columns:
+        return None
+    d = df_norm[df_norm["Ticker"] == ticker].copy()
+    if fecha_inicio is not None:
+        d = d[d["Date"] >= pd.Timestamp(fecha_inicio)]
+    if fecha_fin is not None:
+        d = d[d["Date"] <= pd.Timestamp(fecha_fin)]
+    d = d[["Date", "Precio"] + (["TradingCcy"] if "TradingCcy" in d.columns else [])].dropna(subset=["Precio"])
+    if d.empty:
+        return None
+    d = d.drop_duplicates(subset="Date").sort_values("Date").set_index("Date")
+    precio = d["Precio"]
+    ccy = d["TradingCcy"].dropna().iloc[-1] if "TradingCcy" in d.columns and d["TradingCcy"].notna().any() else ""
+    if not _ccy_es_usd(ccy):
+        return precio.dropna()                      # ya está en pesos
+    # cotiza en USD: convertir a pesos con el A3500 alineado a cada fecha
+    if fx_diario is None or fx_diario.dropna().empty:
+        return None                                 # sin A3500 no se puede pasar a pesos
+    a = fx_diario.dropna()
+    idx_union = pd.DatetimeIndex(sorted(set(a.index) | set(precio.index)))
+    a_ff = a.reindex(idx_union).ffill().reindex(precio.index)
+    return (precio * a_ff).dropna()
+
+
 def peso_price_series(df_norm: pd.DataFrame, ticker: str, fx_diario: pd.Series, cer_diario: pd.Series,
                        fecha_inicio: pd.Timestamp, fecha_fin: pd.Timestamp,
                        fecha_ancla: pd.Timestamp = None) -> pd.Series:
@@ -524,7 +585,15 @@ def peso_price_series(df_norm: pd.DataFrame, ticker: str, fx_diario: pd.Series, 
     que la Paridad sola no captura.
 
     Para instrumentos 'ARS' (LECAP, sin indexación) devuelve la Paridad tal cual:
-    ahí la Paridad ya ES el precio en pesos."""
+    ahí la Paridad ya ES el precio en pesos.
+
+    *** PREFERENCIA: si el dataset trae la COTIZACIÓN real (columna 'Precio'), se usa
+    esa (es exacta) en lugar de reconstruir desde la Paridad. La reconstrucción por
+    Paridad × índice queda solo como respaldo cuando no hay precio. ***"""
+    real = real_peso_price_series(df_norm, ticker, fx_diario, fecha_inicio, fecha_fin)
+    if real is not None and not real.empty:
+        return real
+
     paridad = df_norm[(df_norm["Ticker"] == ticker) & (df_norm["Date"] >= fecha_inicio) &
                        (df_norm["Date"] <= fecha_fin)][["Date", "Paridad"]].dropna()
     paridad = paridad.drop_duplicates(subset="Date").sort_values("Date").set_index("Date")["Paridad"]
@@ -883,20 +952,22 @@ def portfolio_kpis(snap: pd.DataFrame) -> dict:
 # =====================================================================
 
 def compute_compra(port_df: pd.DataFrame, df_norm: pd.DataFrame, fecha_compra: pd.Timestamp,
-                    monto_total: float) -> pd.DataFrame:
+                    monto_total: float, fx_diario: pd.Series = None) -> pd.DataFrame:
     """Simula la compra de TODA la cartera en 'fecha_compra' con 'monto_total',
     repartido según Peso_pct. El VN comprado de cada bono = monto asignado ÷
-    Paridad (precio) en esa fecha. Para Cash, el 'VN' es directamente el monto.
+    (precio en pesos / 100) en esa fecha. Para Cash, el 'VN' es directamente el monto.
 
-    Ojo: acá se usa la Paridad de la fecha de compra como precio inicial — es
-    correcto, porque el factor de indexación VT(t)/VT(compra) vale 1 en t=compra.
-    La indexación entra recién a partir de la compra, en simulacion_semanal."""
+    Precio de compra, con la MISMA prioridad que el resto del motor:
+      1) COTIZACIÓN REAL del dataset (columna 'Precio'), en pesos (o USD×A3500);
+      2) si no hay precio, la Paridad de la fecha de compra (respaldo).
+    Se usa la misma regla que simulacion_semanal para que el VN y la valuación
+    sean consistentes (el valor en t=compra da exactamente el monto invertido)."""
     port = port_df.copy()
     fecha_compra = pd.Timestamp(fecha_compra)
     bond_tickers = port.loc[~port["Es_Cash"], "Ticker"].tolist()
     mkt = snapshot_asof(df_norm, bond_tickers, fecha_compra) if bond_tickers else pd.DataFrame()
 
-    montos, precios, vns, fechas_precio = [], [], [], []
+    montos, precios, vns, fechas_precio, fuentes = [], [], [], [], []
     for _, r in port.iterrows():
         monto_i = monto_total * (r["Peso_pct"] / 100.0)
         montos.append(monto_i)
@@ -904,19 +975,31 @@ def compute_compra(port_df: pd.DataFrame, df_norm: pd.DataFrame, fecha_compra: p
             precios.append(100.0)
             vns.append(monto_i)
             fechas_precio.append(fecha_compra)
+            fuentes.append("cash")
         else:
+            real = real_peso_price_series(df_norm, r["Ticker"], fx_diario, None, fecha_compra)
+            if real is not None and not real.empty:
+                p = float(real.iloc[-1])                 # última cotización real ≤ compra
+                precios.append(p)
+                vns.append(monto_i / (p / 100.0) if p > 0 else np.nan)
+                fechas_precio.append(real.index[-1])
+                fuentes.append("cotización")
+                continue
             m = mkt[mkt["Ticker"] == r["Ticker"]] if not mkt.empty else pd.DataFrame()
             if not m.empty and pd.notna(m.iloc[0].get("Paridad")):
                 p = float(m.iloc[0]["Paridad"])
                 precios.append(p)
                 vns.append(monto_i / (p / 100.0) if p > 0 else np.nan)
                 fechas_precio.append(m.iloc[0]["Date"])
+                fuentes.append("paridad")
             else:
                 precios.append(np.nan)
                 vns.append(np.nan)
                 fechas_precio.append(pd.NaT)
+                fuentes.append("sin dato")
 
     port["Monto_Invertido"] = montos
+    port["Fuente_Precio"] = fuentes
     port["Precio_Compra"] = precios
     port["VN_Comprado"] = vns
     port["Fecha_Precio_Compra"] = fechas_precio
@@ -956,32 +1039,44 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
     piv_par = piv_par.reindex(idx_union).ffill()
     piv_tir = piv_tir.reindex(idx_union).ffill()
 
-    # Factor VT(t)/VT(compra) por indexación real, anclado en la fecha de compra:
-    # en t=compra el factor es 1 (no toca compute_compra), y desde ahí incorpora
-    # la devaluación/CER REAL — lo que la Paridad sola no captura.
-    # Registra los instrumentos INDEXADOS (FX/CER) a los que NO se les pudo
-    # aplicar la indexación porque falta la serie de índice o el ancla: en esos
-    # casos el factor queda en 1.0 y el "precio en pesos" es en realidad la
-    # Paridad cruda (SIN devaluación). Eso es exactamente lo que hace que la
-    # cartera "no suba con el dólar": hay que avisarlo fuerte, no en silencio.
+    # Precio EN PESOS de cada bono, con la MISMA prioridad que el resto del motor:
+    #   1) COTIZACIÓN REAL del dataset (columna 'Precio'): exacta, ya en pesos (o
+    #      USD×A3500 si cotiza en dólares). No necesita ningún supuesto.
+    #   2) RESPALDO: reconstrucción Paridad(t) × factor de indexación VT(t)/VT(compra),
+    #      solo para los tickers SIN cotización. Ahí sí se registra en 'sin_indexar'
+    #      si falta el índice (el precio quedaría sin devaluación).
     factor_idx = {}
-    sin_indexar = []  # [(ticker, tipo, motivo)]
+    sin_indexar = []        # [(ticker, tipo, motivo)] — solo aplica al respaldo por Paridad
+    precio_pesos_ff = {}    # precio en pesos por ticker, sobre idx_union (ffill)
+    usa_cotizacion = {}     # True si salió de cotización real; False si de Paridad
     for tk in bonos:
+        real_hasta_compra = real_peso_price_series(df_norm, tk, fx_diario, None, fecha_compra)
+        if real_hasta_compra is not None and not real_hasta_compra.empty:
+            real_full = real_peso_price_series(df_norm, tk, fx_diario, None, fecha_fin)
+            precio_pesos_ff[tk] = real_full.reindex(
+                pd.DatetimeIndex(sorted(set(real_full.index) | set(idx_union)))).ffill().reindex(idx_union)
+            usa_cotizacion[tk] = True
+            continue
+        # --- respaldo: reconstrucción por Paridad × factor de indexación ---
+        usa_cotizacion[tk] = False
         tipo = IND_TICKER.get(tk, "ARS")
         if tipo == "ARS":
-            factor_idx[tk] = pd.Series(1.0, index=idx_union)
-            continue
-        indice = _indice_diario(tipo, fx_diario, cer_diario)
-        if indice.empty:
-            factor_idx[tk] = pd.Series(1.0, index=idx_union)
-            sin_indexar.append((tk, tipo, "sin serie de índice (A3500/CER no disponible)"))
-            continue
-        ind_ff = indice.reindex(pd.DatetimeIndex(sorted(set(indice.index) | set(idx_union)))).ffill().reindex(idx_union)
-        if fecha_compra not in ind_ff.index or pd.isna(ind_ff.loc[fecha_compra]):
-            factor_idx[tk] = pd.Series(1.0, index=idx_union)
-            sin_indexar.append((tk, tipo, "sin índice en la fecha de ancla (compra)"))
+            factor = pd.Series(1.0, index=idx_union)
         else:
-            factor_idx[tk] = ind_ff / ind_ff.loc[fecha_compra]
+            indice = _indice_diario(tipo, fx_diario, cer_diario)
+            if indice.empty:
+                factor = pd.Series(1.0, index=idx_union)
+                sin_indexar.append((tk, tipo, "sin serie de índice (A3500/CER no disponible)"))
+            else:
+                ind_ff = indice.reindex(pd.DatetimeIndex(sorted(set(indice.index) | set(idx_union)))).ffill().reindex(idx_union)
+                if fecha_compra not in ind_ff.index or pd.isna(ind_ff.loc[fecha_compra]):
+                    factor = pd.Series(1.0, index=idx_union)
+                    sin_indexar.append((tk, tipo, "sin índice en la fecha de ancla (compra)"))
+                else:
+                    factor = ind_ff / ind_ff.loc[fecha_compra]
+        factor_idx[tk] = factor
+        par = piv_par[tk].reindex(idx_union) if tk in piv_par.columns else pd.Series(index=idx_union, dtype=float)
+        precio_pesos_ff[tk] = par * factor
 
     filas = []
     for f in fechas:
@@ -1001,18 +1096,16 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
                 detalle[r["Ticker"]] = val
             else:
                 tk = r["Ticker"]
-                if tk not in piv_par.columns:
+                serie_p = precio_pesos_ff.get(tk)
+                if serie_p is None:
                     continue
-                fvt_serie = factor_idx.get(tk, pd.Series(1.0, index=idx_union))
-                if f <= as_of_hoy and f in piv_par.index:
-                    p_paridad = piv_par.loc[f, tk]
-                    fvt = fvt_serie.get(f, 1.0)
-                    p = p_paridad * fvt if pd.notna(p_paridad) else np.nan
+                if f <= as_of_hoy:
+                    p = serie_p.get(f, np.nan)
                 else:
-                    p_hoy_paridad = piv_par.loc[as_of_hoy, tk] if as_of_hoy in piv_par.index else np.nan
-                    tir_hoy = piv_tir.loc[as_of_hoy, tk] if as_of_hoy in piv_tir.index else np.nan
-                    fvt_hoy = fvt_serie.get(as_of_hoy, 1.0)
-                    p_hoy = p_hoy_paridad * fvt_hoy if pd.notna(p_hoy_paridad) else np.nan
+                    # proyección: se devenga la TIR vigente hoy sobre el último precio
+                    # en pesos real (no se asume devaluación futura).
+                    p_hoy = serie_p.get(as_of_hoy, np.nan)
+                    tir_hoy = piv_tir.loc[as_of_hoy, tk] if (as_of_hoy in piv_tir.index and tk in piv_tir.columns) else np.nan
                     if pd.notna(p_hoy) and pd.notna(tir_hoy):
                         dias_proy = (f - as_of_hoy).days
                         p = p_hoy * (1 + tir_hoy / 100.0) ** (dias_proy / 365.0)
@@ -1035,6 +1128,9 @@ def simulacion_semanal(port_compra: pd.DataFrame, df_norm: pd.DataFrame, fecha_c
         [out["Date"] == fecha_compra, out["Date"] == as_of_hoy, out["Date"] > as_of_hoy],
         ["Compra", "Hoy", "Proyectado"], default="Realizado")
     out.attrs["sin_indexar"] = sin_indexar
+    out.attrs["usa_cotizacion"] = usa_cotizacion
+    out.attrs["tickers_cotizacion"] = [t for t, v in usa_cotizacion.items() if v]
+    out.attrs["tickers_paridad"] = [t for t, v in usa_cotizacion.items() if not v]
     return out
 
 
@@ -1257,7 +1353,7 @@ else:
 
     # Compra del 29/6 y simulación semanal — se calculan UNA vez (con las series
     # de indexación) y se reusan en todas las pestañas.
-    port_compra = compute_compra(port_df, df_norm, fecha_compra, monto_compra)
+    port_compra = compute_compra(port_df, df_norm, fecha_compra, monto_compra, fx_diario=fx_diario)
     semanal = simulacion_semanal(port_compra, df_norm, fecha_compra, as_of_hoy, fecha_fin_sim,
                                   fx_diario=fx_diario, cer_diario=cer_diario)
 
@@ -1290,8 +1386,36 @@ with tab_hoy:
         k4.metric("Valor actual (hoy)", fmt_ars(valor_actual_hoy),
                   f"{resultado_pct_hoy:+.2f}% desde la compra" if pd.notna(resultado_pct_hoy) else None)
         st.caption(f"Snapshot al {as_of_hoy.strftime('%d/%m/%Y')}" + (" (datos de ejemplo)" if modo_demo else "") +
-                   f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')} · El 'Valor actual' incorpora la "
-                   f"indexación real (FX/CER) de los instrumentos, no solo la Paridad.")
+                   f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')}.")
+
+        # --- Fuente del precio: cotización real vs. Paridad reconstruida ---
+        _price_col = df_norm.attrs.get("price_col_detectada") if isinstance(df_norm, pd.DataFrame) else None
+        _tk_cotiz = semanal.attrs.get("tickers_cotizacion", []) if isinstance(semanal, pd.DataFrame) else []
+        _tk_parid = semanal.attrs.get("tickers_paridad", []) if isinstance(semanal, pd.DataFrame) else []
+        if _price_col and _tk_cotiz:
+            _peso_cotiz = port_df.loc[port_df["Ticker"].isin(_tk_cotiz), "Peso_pct"].sum()
+            st.success(f"✅ **Precios = COTIZACIÓN REAL del dataset** (columna `{_price_col}`) para "
+                       f"{_peso_cotiz:.1f}% de la cartera: {', '.join(_tk_cotiz)}. El precio en pesos sale del "
+                       f"mercado, NO de reconstruir la Paridad — es exacto e incorpora la devaluación por sí "
+                       f"solo." + (f" El resto ({', '.join(_tk_parid)}) usa Paridad × índice como respaldo."
+                                   if _tk_parid else ""))
+        else:
+            st.warning("ℹ️ **El dataset NO trae columna de cotización/precio** (o no se detectó): el 'Valor "
+                       "actual' se **reconstruye** como `Paridad × A3500/A3500(compra)`. Es un supuesto (asume "
+                       "que el Valor Técnico se mueve 1:1 con el A3500), no el precio de mercado real. Si tu "
+                       "dataset SÍ tiene precio con otro nombre de columna, decímelo y lo conecto — mirá abajo "
+                       "el diagnóstico de columnas.")
+
+        with st.expander("🔬 Diagnóstico del dataset — ¿hay columna de precio/cotización?"):
+            _cols = df_norm.attrs.get("columnas_crudas") if isinstance(df_norm, pd.DataFrame) else None
+            st.write(f"**Columna de precio detectada:** `{_price_col}`" if _price_col else
+                     "**Columna de precio detectada:** ninguna — se usa la reconstrucción por Paridad.")
+            if _cols:
+                st.write("**Columnas del dataset (tras normalizar):**")
+                st.code(", ".join(map(str, _cols)))
+            st.write("**Columnas presentes en df_norm:** " + ", ".join(map(str, df_norm.columns)))
+            st.caption("Si ves acá una columna que es la cotización (precio de mercado) y no está siendo "
+                       "usada, avisá el nombre exacto: se agrega a la detección y todo el motor pasa a usarla.")
 
         _sin_idx = semanal.attrs.get("sin_indexar", []) if isinstance(semanal, pd.DataFrame) else []
         if _sin_idx:
@@ -1398,7 +1522,7 @@ with tab_sim:
                      use_container_width=True, hide_index=True, height=300,
                      column_config={
                          "Monto_Invertido": st.column_config.NumberColumn("Monto invertido", format="$ %.0f"),
-                         "Precio_Compra": st.column_config.NumberColumn("Precio de compra (Paridad)", format="%.2f"),
+                         "Precio_Compra": st.column_config.NumberColumn("Precio de compra (cotización o Paridad)", format="%.2f"),
                          "VN_Comprado": st.column_config.NumberColumn("VN comprado", format="%.0f"),
                      })
         sin_precio = port_compra.loc[port_compra["VN_Comprado"].isna(), "Ticker"].tolist()
@@ -2154,30 +2278,30 @@ with tab_metodo:
     mercado (Sovereign/Corporate) y estructura de cupón por ticker y fecha.
 
     ---
-    #### ⚠️ Corrección clave: Paridad ≠ precio en pesos para instrumentos indexados
+    #### ⚠️ Precio de mercado (cotización) vs. Paridad — qué usa el motor
 
-    La **Paridad** de Alphacast = Precio de mercado ÷ Valor Técnico. Para un bono **no indexado**
-    (una LECAP como S31L6), el Valor Técnico es estable y la Paridad se parece al precio en pesos.
-    Pero para un bono **indexado** el Valor Técnico NO es constante:
+    La **Paridad** = Precio de mercado ÷ Valor Técnico. **NO es el precio.** El precio en pesos puede
+    subir aunque la Paridad baje, si sube el tipo de cambio (para un bono en dólares) o el índice.
 
-    - **Dollar-Linked** (D31M7, D30S6) y **Hard-Dollar / soberano en USD** (TLCQO, LOC5O, AO27):
-      el Valor Técnico se mueve 1:1 con el **A3500** (tipo de cambio oficial).
-    - **CER** (TZXD6): el Valor Técnico se mueve con el **CER** (inflación).
+    **Prioridad del motor (de mejor a peor):**
 
-    Si se usa la Paridad sola como "precio en pesos", se le **resta al instrumento toda su indexación**:
-    un Dollar-Linked que está cubriendo perfectamente muestra una Paridad casi plana, y su "retorno"
-    calculado da ~0 — aunque en pesos el bono valga muchísimo más por la devaluación. Ese era el bug:
-    la cartera (86% DL) aparecía muy por debajo del A3500 y el Hedge Ratio salía artificialmente bajo.
+    1. **COTIZACIÓN REAL (columna de precio del dataset).** Es lo correcto y lo que usa la app cuando
+       está disponible. El precio en pesos sale del mercado, sin ningún supuesto:
+       - bonos que **cotizan en pesos** (Dollar-Linked, CER, LECAP) → el precio ya está en pesos e
+         incorpora la devaluación / indexación por sí solo (no hace falta A3500 ni CER);
+       - bonos que **cotizan en dólares** (Hard-Dollar) → se pasan a pesos con el A3500 del día.
+    2. **RESPALDO — reconstrucción por Paridad** (solo si el dataset no trae precio para ese papel):
 
-    **Corrección aplicada:** el precio en pesos de cada instrumento indexado se reconstruye como
+       > **Precio_pesos(t) = Paridad(t) × [ Índice(t) / Índice(ancla) ]**
 
-    > **Precio_pesos(t) = Paridad(t) × [ Índice(t) / Índice(ancla) ]**
+       con *Índice* = A3500 (FX) o CER, anclado en la compra. Es un **supuesto** (que el Valor Técnico
+       se mueve 1:1 con el índice) y depende de que el A3500/CER esté disponible; por eso es respaldo,
+       no la fuente principal. Cuando se cae en este respaldo, la pestaña Cartera Hoy lo avisa.
 
-    donde *Índice* es el A3500 (FX) o el CER según el instrumento, y *ancla* es la fecha de compra
-    (o el primer dato del papel). No se necesita ni la fecha de emisión ni el Valor Técnico nominal
-    real: como solo importan retornos relativos, alcanza con anclar el VT y hacerlo crecer con el
-    índice real. Todo el motor (simulación semanal, valor de la cartera, benchmark, Hedge Ratio y
-    ratios de riesgo) opera ahora sobre este **precio en pesos**, no sobre la Paridad cruda.
+    Usar la Paridad **cruda** como precio (versión vieja) le restaba toda la indexación: un DL que
+    cubre perfecto mostraba Paridad casi plana y "retorno" ~0 aunque en pesos valiera mucho más por la
+    devaluación. Con la cotización real ese problema desaparece de raíz. Todo el motor (simulación,
+    valor de cartera, benchmark, Hedge Ratio y ratios) opera sobre este **precio en pesos**.
 
     ---
 
