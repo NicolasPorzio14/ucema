@@ -2016,6 +2016,34 @@ with tab_bench:
                 Desde=m_comb["desde"], Hasta=m_comb["hasta"], Beta=m_comb["beta"],
                 Elasticidad_nivel=ela_comb["elast"], Correlacion=m_comb["corr"]))
 
+            # *** Hedge Ratio DIARIO — métrica principal recomendada ***
+            # Usa TODA la historia real disponible de D31M7+D30S6 (no la ventana del
+            # slider semanal) y compara pares de fechas REALES de cotización (sin
+            # grilla semanal, sin ffill): cada retorno del bono se empareja contra el
+            # retorno del A3500 EXACTAMENTE entre esas mismas dos fechas. Esto elimina
+            # de raíz el problema de stale-pricing (no hay precio repetido que diluya
+            # la covarianza) y además da más observaciones que la agregación semanal,
+            # porque no se pierde nada entre semanas: cada cotización real cuenta.
+            if pd.notna(m_comb["beta"]):
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Hedge Ratio (β dollar-offset) — DIARIO", f"{m_comb['beta']:.2f}",
+                          "1,00 = se mueve 1:1 con el dólar")
+                d2.metric("Correlación diaria vs. A3500", f"{m_comb['corr']:.2f}" if pd.notna(m_comb['corr']) else "—")
+                d3.metric("N° observaciones diarias", f"{m_comb['n']}")
+                st.caption(f"**β diario = {m_comb['beta']:.2f}** sobre "
+                           f"{pd.Timestamp(m_comb['desde']).strftime('%d/%m/%Y')} → "
+                           f"{pd.Timestamp(m_comb['hasta']).strftime('%d/%m/%Y')} ({m_comb['n']} observaciones). "
+                           f"Esta es la medición RECOMENDADA de cobertura: usa cada cotización real de "
+                           f"D31M7+D30S6 (toda la historia disponible, no solo la ventana del slider) pareada "
+                           f"contra el A3500 en las mismas fechas exactas — sin agregar a una grilla semanal "
+                           f"ni rellenar precios viejos, así que no puede diluirse por iliquidez. Si este "
+                           f"número da bien por debajo de 1 (y la correlación también es baja), ya no es un "
+                           f"problema de metodología de datos: es que el bono realmente no está calzando con "
+                           f"el dólar en el período (spread/paridad se movió por su cuenta). Compará contra "
+                           f"el 'Hedge Ratio (β dollar-offset)' semanal más abajo — si el diario da "
+                           f"sistemáticamente más alto, confirma que la agregación semanal todavía diluye "
+                           f"algo; si dan parecidos, el numero bajo es real, no un artefacto.")
+
             tabla_diaria = pd.DataFrame(filas_diario)
             st.dataframe(tabla_diaria, use_container_width=True, hide_index=True,
                          column_config={
@@ -2083,8 +2111,9 @@ with tab_bench:
         merged_obj2["ret_A3500"] = merged_obj2["A3500"].pct_change()
         n_semanas_hedge = int(merged_obj2["ret"].notna().sum())
 
-        st.markdown("*Objetivo 2 combinado (D31M7 + D30S6 ponderado — se recalcula el peso relativo cada "
-                    "semana entre los que sí tienen dato):*")
+        st.markdown("*Objetivo 2 combinado, agregado SEMANAL (D31M7 + D30S6 ponderado — se recalcula el "
+                    "peso relativo cada semana entre los que sí tienen dato) — cross-check del β diario de "
+                    "arriba, sobre la ventana del slider en vez de toda la historia:*")
         validos_obj2 = merged_obj2.dropna(subset=["ret"])
         if len(validos_obj2) >= 8:
             fecha_ini_valida = validos_obj2["Date"].iloc[0]
