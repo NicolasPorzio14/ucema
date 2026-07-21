@@ -813,12 +813,25 @@ def sharpe_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 
     return float(excess.mean() / sd * np.sqrt(periods_per_year))
 
 
-def sortino_ratio(returns: pd.Series, rf_periodo: float, periods_per_year: int = 52) -> float:
-    """Sortino anualizado: solo penaliza la volatilidad a la baja."""
-    r = returns.dropna()
-    if len(r) < 2:
-        return np.nan
-    excess = r - rf_periodo
+def sortino_ratio(returns: pd.Series, rf_periodo, periods_per_year: int = 52) -> float:
+    """Sortino anualizado: solo penaliza la volatilidad a la baja.
+
+    'rf_periodo' acepta un ESCALAR (tasa fija, ej. TNA de la caución) o una
+    pd.Series (referencia variable en el tiempo, ej. un benchmark indexado
+    CER/FX) — en ese caso se alinea por fecha antes de restar, igual que
+    information_ratio. Con un benchmark indexado como referencia, el downside
+    deja de estar sesgado por comparar un instrumento indexado contra una tasa
+    nominal en pesos (ver nota en la UI de Objetivo 1)."""
+    if isinstance(rf_periodo, pd.Series):
+        df = pd.concat([returns, rf_periodo], axis=1).dropna()
+        if len(df) < 2:
+            return np.nan
+        excess = df.iloc[:, 0] - df.iloc[:, 1]
+    else:
+        r = returns.dropna()
+        if len(r) < 2:
+            return np.nan
+        excess = r - rf_periodo
     downside = excess[excess < 0]
     if len(downside) < 2:
         return np.nan
@@ -1981,14 +1994,33 @@ with tab_bench:
             if port_df["Es_Cash"].any() and port_df.loc[port_df["Es_Cash"], "TNA_Manual_pct"].notna().any() else 0.0
         rf_semanal = (1 + tna_rf / 100.0) ** (7 / 365.0) - 1
 
+        # Nominales (vs. TNA en pesos) — se calculan igual que antes, pero ya NO
+        # son los que se muestran como principales: quedan en el expander de
+        # abajo como referencia de "cuánto infla el número comparar contra una
+        # tasa no indexada" (ver diagnóstico completo ahí).
         sh = sharpe_ratio(merged_ext["ret"], rf_semanal)
         so = sortino_ratio(merged_ext["ret"], rf_semanal)
-        ir = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
 
-        # Umbral de alerta visual — mismo criterio que ya se explicaba en texto
-        # chico más abajo ("Sharpe > 2-3 es más artefacto de suavidad..."), ahora
-        # también como badge pegado al número para que no dependa de leer el
-        # párrafo de abajo.
+        # *** Ratios REALES (ajustados por indexación) — ahora la referencia
+        # ("rf") NO es una tasa fija en pesos sino el benchmark compuesto CER+SHY
+        # de Objetivo 1 (ret_obj1_bench), que ya se descarga y arma más arriba
+        # para el gráfico de benchmarks. Sharpe-contra-un-benchmark-variable es,
+        # por definición, EXACTAMENTE el Information Ratio (mismo cálculo:
+        # retorno activo ÷ tracking error) — por eso se muestran como un único
+        # número con las dos etiquetas, en vez de duplicar la tarjeta. El
+        # Sortino real SÍ es una métrica nueva (no existía): mismo benchmark,
+        # pero el desvío solo considera semanas por debajo de él. Ver
+        # diagnóstico completo en el expander de abajo — resumen: comparar un
+        # instrumento CER/FX-indexado contra una TNA en pesos infla el "exceso
+        # de retorno" con el propio devengamiento de la indexación (que no es
+        # compensación por riesgo), no con alfa real. Contra el benchmark
+        # indexado, ese efecto se cancela y lo que queda es desempeño genuino.
+        sh_real = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
+        so_real = sortino_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
+
+        # Umbral de alerta visual para los NOMINALES (los que se inflan) — mismo
+        # criterio que ya se explicaba en texto chico, ahora como badge pegado
+        # al número para que no dependa de leer el párrafo de abajo.
         SHARPE_UMBRAL_ALERTA = 2.5
         _sh_alerta = "⚠️ posible artefacto de suavidad" if pd.notna(sh) and sh > SHARPE_UMBRAL_ALERTA else None
         _so_alerta = "⚠️ posible artefacto de suavidad" if pd.notna(so) and so > SHARPE_UMBRAL_ALERTA else None
@@ -1997,28 +2029,46 @@ with tab_bench:
                 f"**{n_reales_ext} son reales** (con cotización de mercado del propio período) y "
                 f"**{n_reconstruidas_ext} son reconstruidas** (Paridad × índice FX/CER — un supuesto, no "
                 f"un precio de mercado, para instrumentos que ya cotizaban antes de esta ventana pero sin "
-                f"columna de precio real en el dataset). Cuantas más semanas reconstruidas, más el Sharpe/"
-                f"Sortino de acá reflejan el supuesto de indexación en vez de precios de mercado observados.")
+                f"columna de precio real en el dataset). Cuantas más semanas reconstruidas, más estos "
+                f"ratios reflejan el supuesto de indexación en vez de precios de mercado observados.")
 
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric(f"Sharpe (rf = TNA caución {tna_rf:.1f}%)", f"{sh:.2f}" if pd.notna(sh) else "—",
-                  delta=_sh_alerta, delta_color="inverse")
-        r2.metric(f"Sortino (rf = TNA caución {tna_rf:.1f}%)", f"{so:.2f}" if pd.notna(so) else "—",
-                  delta=_so_alerta, delta_color="inverse")
-        r3.metric("Information Ratio", f"{ir:.2f}" if pd.notna(ir) else "—")
-        r4.metric("N° semanas usadas", f"{n_semanas_ext}",
-                  f"{n_reales_ext} reales · {n_reconstruidas_ext} reconstr.", delta_color="off")
-        st.caption(f"Sharpe = (retorno medio semanal − rf semanal) ÷ desvío semanal, anualizado ×√52. La "
-                   f"tasa libre de riesgo es la TNA de la caución ({tna_rf:.1f}%) llevada a semanal "
-                   f"(rf_sem = {rf_semanal*100:.3f}%): se resta porque los retornos ya son nominales en "
-                   f"pesos e incluyen la indexación FX/CER — con rf=0 el número se inflaba artificialmente. "
-                   f"Sortino: igual, pero el desvío solo considera semanas por debajo de rf. Benchmark del "
-                   f"Information Ratio: el compuesto de Objetivo 1 (CER + SHY). "
+        st.markdown("**Ratios ajustados por indexación (recomendados)**")
+        rr1, rr2, rr3 = st.columns(3)
+        rr1.metric("Sharpe real (= Information Ratio)", f"{sh_real:.2f}" if pd.notna(sh_real) else "—")
+        rr2.metric("Sortino real", f"{so_real:.2f}" if pd.notna(so_real) else "—")
+        rr3.metric("N° semanas usadas", f"{n_semanas_ext}",
+                   f"{n_reales_ext} reales · {n_reconstruidas_ext} reconstr.", delta_color="off")
+        st.caption(f"**Referencia = benchmark compuesto de Objetivo 1 (CER + SHY), NO una tasa fija en "
+                   f"pesos.** Retorno activo (Objetivo 1 − benchmark) ÷ desvío del retorno activo, "
+                   f"anualizado ×√52 — Sortino usa solo las semanas donde el activo quedó por debajo del "
+                   f"benchmark. Al restar un benchmark que TAMBIÉN está indexado (en vez de una TNA en "
+                   f"pesos), el devengamiento por inflación/FX se cancela de los dos lados y lo que queda "
+                   f"es desempeño relativo genuino, no el paso de la indexación disfrazado de alfa. "
                    f"Ventana: {fecha_inicio_ext.strftime('%d/%m/%Y')} → {as_of_hoy.strftime('%d/%m/%Y')}.")
-        st.caption("⚠️ Aun corregido, tené presente que los instrumentos de devengamiento suave (CER, DL) "
-                   "tienden a mostrar un Sharpe alto porque su volatilidad semanal subestima el riesgo real "
-                   "(duration, crédito, liquidez, saltos de mercado que no se ven en la Paridad × índice). "
-                   "Un Sharpe > 2-3 acá es más un artefacto de suavidad que una señal de calidad excepcional.")
+
+        with st.expander("📎 Ver también: Sharpe/Sortino NOMINALES (vs. TNA en pesos) — por qué dan inflados"):
+            r1, r2 = st.columns(2)
+            r1.metric(f"Sharpe nominal (rf = TNA caución {tna_rf:.1f}%)", f"{sh:.2f}" if pd.notna(sh) else "—",
+                      delta=_sh_alerta, delta_color="inverse")
+            r2.metric(f"Sortino nominal (rf = TNA caución {tna_rf:.1f}%)", f"{so:.2f}" if pd.notna(so) else "—",
+                      delta=_so_alerta, delta_color="inverse")
+            st.caption(f"Sharpe = (retorno medio semanal − rf semanal) ÷ desvío semanal, anualizado ×√52. La "
+                       f"tasa libre de riesgo acá es la TNA de la caución ({tna_rf:.1f}%) llevada a semanal "
+                       f"(rf_sem = {rf_semanal*100:.3f}%). Sortino: igual, pero el desvío solo considera "
+                       f"semanas por debajo de esa rf.")
+            st.caption("⚠️ **Por qué dan tan altos.** Objetivo 1 es ~50% CER (TZXD6) + ~30% Hard-Dollar "
+                       "(TLCQO/LOC5O/AO27, indexados al A3500): la MAYORÍA del retorno semanal de esos "
+                       "instrumentos es el devengamiento de un índice que crece suave y casi sin ruido "
+                       "(CER interpolado, FX bajo régimen de bandas) — no es 'riesgo tomado', es indexación. "
+                       "Al restarle una TNA en pesos (no indexada), ese devengamiento entero se cuenta como "
+                       "'exceso de retorno', inflando la media sin agregar volatilidad proporcional al "
+                       "denominador. Una simulación con la misma mecánica del motor mostró Sharpe = 0,47 "
+                       "usando el precio total (Paridad × CER) pero Sharpe = −7,10 usando SOLO la Paridad "
+                       "(sin el CER) — misma volatilidad, la diferencia entera es el mismatch de benchmark. "
+                       "El Sortino nominal además se calcula con MUY pocas semanas 'downside' (acá casi "
+                       "todo queda por encima de la TNA): un desvío sobre 2-3 puntos es estadísticamente "
+                       "poco confiable y por eso suele dar más alto todavía que el Sharpe. Por ambos motivos, "
+                       "los ratios REALES de arriba (contra el benchmark indexado) son los recomendados.")
 
         # *** Cross-check DIARIO — para responder si conviene medir el desvío
         # estándar sobre retornos diarios en vez de semanales. Reusa el mismo
