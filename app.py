@@ -125,6 +125,16 @@ HEDGE_MIN_FX_MOVE = 0.02  # 2%
 # DATO (NaN) para ese ticker en vez de repetir un precio desactualizado.
 FFILL_MAX_DIAS_STALE = 10
 
+# Peso normalizado (dentro de la combinación, ej. D31M7+D30S6 de Objetivo 2) a partir
+# del cual, si un instrumento TODAVÍA NO COTIZÓ NUNCA en todo el dataset (no que esta
+# semana puntual no operó — que directamente no existía cotización en ninguna fecha
+# anterior), la semana se descarta (NaN) en vez de renormalizar sobre lo poco que sí
+# tiene dato. Sin este piso, semanas donde falta el componente DOMINANTE (ej. D31M7,
+# ~92% del peso interno de Objetivo 2) quedan representadas 100% por el componente
+# minoritario (D30S6, ~8%) — no es "Objetivo 2 con menos cobertura", es una mezcla
+# distinta que no debería entrar en la misma regresión de β.
+PESO_MIN_NO_LISTADO = 0.15
+
 COLORS = {
     "primary": "#1f2a44",
     "accent": "#c8963e",
@@ -697,8 +707,12 @@ def hedge_ratio_directo(precio_activo: pd.Series, precio_bench: pd.Series) -> di
     # movió al menos HEDGE_MIN_FX_MOVE; si no, no es interpretable → se usa la beta.
     hr = (ret_activo / ret_bench * 100) if abs(ret_bench) >= HEDGE_MIN_FX_MOVE else np.nan
 
-    ret_activo_serie = a.pct_change()
-    b_alineado = b.reindex(a.index).pct_change()
+    # fill_method=None: el A3500 del BCRA tiene huecos puntuales (días sin dato
+    # publicado). Sin esto, pct_change() rellena ('pad') el hueco antes de
+    # calcular el retorno del benchmark — mismo problema de precio repetido
+    # que el de stale-pricing, pero del lado del A3500 en vez del bono.
+    ret_activo_serie = a.pct_change(fill_method=None)
+    b_alineado = b.reindex(a.index).pct_change(fill_method=None)
     hb = hedge_beta(ret_activo_serie, b_alineado)
 
     return dict(n=len(a), hedge_ratio=hr, beta=hb["beta"], corr=hb["corr"],
@@ -879,6 +893,14 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
     precio) — evita que semanas con retorno artificial ~0% (por precio repetido)
     diluyan la covarianza contra el A3500 y hundan el Hedge Ratio β. ***
 
+    *** Anti sustitución de componente NO LISTADO: "renormalizar entre los que sí
+    tienen dato" está bien para un hueco temporal (el bono existe pero no operó esa
+    semana), pero es un error si el componente directamente NUNCA COTIZÓ hasta esa
+    fecha (recién va a debutar más adelante en el dataset) — ahí no es que "falta
+    peso", es que la combinación completa (ej. D31M7+D30S6) todavía no existe como
+    tal. Si el peso normalizado de componentes no listados supera PESO_MIN_NO_LISTADO,
+    la semana se descarta entera en vez de quedar representada solo por el resto. ***
+
     Devuelve (df[Date, ret], tickers_sin_dato, fecha_inicio_real)."""
     fecha_fin = pd.Timestamp(fecha_fin)
     fecha_inicio = fecha_fin - pd.Timedelta(weeks=int(semanas))
@@ -921,6 +943,23 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
     ret_total = (contrib_bonos + w_cash * ret_cash_semanal) / peso_total_disponible.replace(0, np.nan)
     if len(ret_total):
         ret_total.iloc[0] = np.nan  # la primera fecha no tiene período previo
+
+    # Descarta semanas donde un componente con peso significativo TODAVÍA NO
+    # COTIZÓ NUNCA (primera fecha con dato en TODO el dataset, no solo en la
+    # ventana) — ver nota "Anti sustitución de componente NO LISTADO" arriba.
+    primeras_listado = primer_dato_disponible(df_norm, bonos)
+    peso_no_listado = pd.Series(0.0, index=fechas)
+    for t in bonos:
+        w_t = float(w_bonos.get(t, 0.0))
+        if w_t <= 0:
+            continue
+        primera_t = primeras_listado.get(t)
+        if primera_t is None:
+            peso_no_listado = peso_no_listado + w_t
+        else:
+            peso_no_listado = peso_no_listado + pd.Series(
+                np.where(fechas < pd.Timestamp(primera_t), w_t, 0.0), index=fechas)
+    ret_total = ret_total.where(peso_no_listado.reindex(ret_total.index) <= PESO_MIN_NO_LISTADO)
 
     out = pd.DataFrame({"Date": fechas, "ret": ret_total.reindex(fechas).values,
                          "peso_cubierto_pct": (peso_total_disponible.reindex(fechas) * 100).values})
@@ -2140,7 +2179,14 @@ with tab_bench:
                        f"Anti stale-pricing: si un bono no operó en más de {FFILL_MAX_DIAS_STALE} días, esa "
                        f"semana queda SIN DATO para ese ticker (no repite precio viejo) — evita que semanas de "
                        f"retorno artificial ~0% (por iliquidez) diluyan la covarianza contra el A3500 y hundan "
-                       f"el β por debajo de su valor real.")
+                       f"el β por debajo de su valor real. Anti sustitución de componente no listado: si D31M7 "
+                       f"o D30S6 directamente TODAVÍA NO COTIZABAN esa semana (no que no operaron ese día, sino "
+                       f"que ni existía cotización en el dataset — típico al ampliar la ventana más allá de la "
+                       f"fecha de emisión), la semana se descarta entera en vez de quedar representada solo por "
+                       f"el otro instrumento con su peso 'inflado' al 100%. Antes de este fix, varias semanas de "
+                       f"la ventana mostraban el retorno de D30S6 SOLO (6,9% de la cartera) pasando por "
+                       f"'Objetivo 2 (86,0%)' porque D31M7 (79,1%, el dominante) todavía no tenía historia — eso "
+                       f"mezclaba dos instrumentos de perfil distinto en una sola regresión y hundía el β.")
         else:
             st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
                        f"muy poco para que el Hedge Ratio o la correlación signifiquen algo.")
