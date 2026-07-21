@@ -116,6 +116,15 @@ IND_TICKER = {
 # no el cociente.
 HEDGE_MIN_FX_MOVE = 0.02  # 2%
 
+# Antigüedad máxima (días corridos) que se arrastra el último precio conocido de un
+# bono al armar la grilla semanal (extended_weekly_returns). Sin este tope, un papel
+# ilíquido (D31M7/D30S6 pueden pasar semanas sin operar) queda con el precio repetido
+# y su retorno da ~0% esa semana mientras el A3500 sí se movió — eso baja la covarianza
+# sin bajar la varianza del benchmark y hunde el Hedge Ratio β artificialmente (sesgo
+# de "stale pricing" / trading no sincrónico). Más viejo que esto, la semana queda SIN
+# DATO (NaN) para ese ticker en vez de repetir un precio desactualizado.
+FFILL_MAX_DIAS_STALE = 10
+
 COLORS = {
     "primary": "#1f2a44",
     "accent": "#c8963e",
@@ -500,6 +509,21 @@ def _align_to_dates(df_diario: pd.DataFrame, fechas: pd.DatetimeIndex, cols: lis
     return d.reindex(fechas)[cols].reset_index().rename(columns={"index": "Date"})
 
 
+def _ffill_edad_max(serie: pd.Series, target_index: pd.DatetimeIndex, max_dias: int) -> pd.Series:
+    """Forward-fill de 'serie' sobre 'target_index', pero solo hasta 'max_dias' desde el
+    último dato REAL: más viejo que eso, NaN en vez de repetir el precio. Evita el sesgo
+    de stale pricing (ver FFILL_MAX_DIAS_STALE) que un ffill sin límite introduce cuando
+    el activo es ilíquido y el benchmark cotiza todos los días."""
+    if serie.empty:
+        return pd.Series(index=target_index, dtype=float)
+    idx_union = pd.DatetimeIndex(sorted(set(serie.index) | set(target_index)))
+    valor = serie.reindex(idx_union)
+    fecha_dato = pd.Series(idx_union, index=idx_union).where(valor.notna()).ffill()
+    edad_dias = (pd.Series(idx_union, index=idx_union) - fecha_dato).dt.days
+    filled = valor.ffill().where(edad_dias <= max_dias)
+    return filled.reindex(target_index)
+
+
 def primer_dato_disponible(df_norm: pd.DataFrame, tickers: list) -> dict:
     """Primera fecha con Paridad no nula para cada ticker, en TODO el dataset."""
     out = {}
@@ -848,6 +872,13 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
     *** Ahora los retornos salen del PRECIO EN PESOS ajustado por indexación
     (peso_price_series), no de la Paridad cruda. *** Cada semana pondera solo
     entre los tickers con dato ese día (re-normalizando por el peso disponible).
+
+    *** Anti stale-pricing: el precio de cada bono se arrastra (ffill) a la grilla
+    semanal como máximo FFILL_MAX_DIAS_STALE días desde su último precio real. Un
+    papel que no operó en más tiempo que eso queda SIN DATO esa semana (no repite
+    precio) — evita que semanas con retorno artificial ~0% (por precio repetido)
+    diluyan la covarianza contra el A3500 y hundan el Hedge Ratio β. ***
+
     Devuelve (df[Date, ret], tickers_sin_dato, fecha_inicio_real)."""
     fecha_fin = pd.Timestamp(fecha_fin)
     fecha_inicio = fecha_fin - pd.Timedelta(weeks=int(semanas))
@@ -868,13 +899,15 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
             faltan.append(t)
             precios_semanales[t] = pd.Series(index=fechas, dtype=float)
             continue
-        idx_union = pd.DatetimeIndex(sorted(set(serie.index) | set(fechas)))
-        precios_semanales[t] = serie.reindex(idx_union).ffill().reindex(fechas)
+        precios_semanales[t] = _ffill_edad_max(serie, fechas, FFILL_MAX_DIAS_STALE)
 
     piv_precio = pd.DataFrame(precios_semanales)
     if piv_precio.empty:
         piv_precio = pd.DataFrame(index=fechas)
-    ret_bonos = piv_precio.pct_change()
+    # fill_method=None: crítico para que el tope de antigüedad de _ffill_edad_max
+    # sirva de algo — el default viejo de pandas ('pad') volvía a rellenar los NaN
+    # antes de calcular el retorno, anulando el corte de stale-pricing.
+    ret_bonos = piv_precio.pct_change(fill_method=None)
     w_bonos = sub.set_index("Ticker")["Peso_norm"].reindex(bonos).fillna(0.0)
     peso_disponible = ret_bonos.notna().astype(float).mul(w_bonos, axis=1).sum(axis=1)
     contrib_bonos = ret_bonos.fillna(0.0).mul(w_bonos, axis=1).sum(axis=1)
@@ -2074,7 +2107,11 @@ with tab_bench:
                        f"movió poco. Nota: acá es β de retornos SEMANALES; la **elasticidad de nivel** (más "
                        f"arriba, en el análisis diario) mira el precio contra el A3500 en niveles y suele dar "
                        f"algo más alta (~1,3) porque incluye la apreciación de precio del bono, no solo la "
-                       f"cobertura. Se sacó la 'captura acumulada': daba valores absurdos con el dólar casi plano.")
+                       f"cobertura. Se sacó la 'captura acumulada': daba valores absurdos con el dólar casi plano. "
+                       f"Anti stale-pricing: si un bono no operó en más de {FFILL_MAX_DIAS_STALE} días, esa "
+                       f"semana queda SIN DATO para ese ticker (no repite precio viejo) — evita que semanas de "
+                       f"retorno artificial ~0% (por iliquidez) diluyan la covarianza contra el A3500 y hundan "
+                       f"el β por debajo de su valor real.")
         else:
             st.warning(f"⚠️ Solo **{n_semanas_hedge} semana(s)** con dato utilizable en la ventana elegida — "
                        f"muy poco para que el Hedge Ratio o la correlación signifiquen algo.")
