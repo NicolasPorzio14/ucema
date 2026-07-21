@@ -188,6 +188,21 @@ def fmt_ars(x: float) -> str:
     return f"${x:,.0f}".replace(",", ".")
 
 
+def fmt_pct_signed(x: float, decimals: int = 1) -> str:
+    """Formatea un % CON SIGNO evitando el '-0.0%' engañoso (ej. -0.03% redondeado
+    a 1 decimal da '-0.0%', que lee como una caída cuando en realidad es ~0). Si
+    redondea a cero, prueba un decimal más de precisión; si aun así da cero,
+    muestra '0.0%' sin signo negativo en vez de un '-0.0%' sin sentido."""
+    if pd.isna(x):
+        return "—"
+    d = decimals
+    if round(x, d) == 0 and x != 0:
+        d += 1
+    if round(x, d) == 0:
+        return f"{0:.{decimals}f}%"
+    return f"{x:+.{d}f}%"
+
+
 # =====================================================================
 # Clasificación de instrumentos (misma convención que el panel PRO)
 # =====================================================================
@@ -901,7 +916,15 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
     tal. Si el peso normalizado de componentes no listados supera PESO_MIN_NO_LISTADO,
     la semana se descarta entera en vez de quedar representada solo por el resto. ***
 
-    Devuelve (df[Date, ret], tickers_sin_dato, fecha_inicio_real)."""
+    *** Real vs. reconstruida: cada semana se etiqueta según de dónde salió la
+    MAYORÍA del peso que la compone — de la COTIZACIÓN real del dataset (columna
+    'Precio') o de la reconstrucción Paridad × índice (un supuesto, no un precio
+    de mercado). Es informativo para no confundir "más semanas" con "más semanas
+    de calidad equivalente": una ventana larga puede estar sumando muestra sobre
+    todo a costa de semanas reconstruidas. Ver n_reales / n_reconstruidas. ***
+
+    Devuelve (df[Date, ret], tickers_sin_dato, fecha_inicio_real, n_reales,
+    n_reconstruidas)."""
     fecha_fin = pd.Timestamp(fecha_fin)
     fecha_inicio = fecha_fin - pd.Timedelta(weeks=int(semanas))
     fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, freq="W-MON")
@@ -914,7 +937,7 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
     sub["Peso_norm"] = sub["Peso_pct"] / peso_total_sub if peso_total_sub > 0 else 0.0
     bonos = sub.loc[~sub["Es_Cash"], "Ticker"].tolist()
 
-    precios_semanales, faltan = {}, []
+    precios_semanales, faltan, es_cotizacion_real = {}, [], {}
     for t in bonos:
         serie = peso_price_series(df_norm, t, fx_diario, cer_diario, fecha_inicio, fecha_fin)
         if serie.empty:
@@ -922,6 +945,12 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
             precios_semanales[t] = pd.Series(index=fechas, dtype=float)
             continue
         precios_semanales[t] = _ffill_edad_max(serie, fechas, FFILL_MAX_DIAS_STALE)
+        # peso_price_series prefiere la cotización real ('Precio') y solo cae a
+        # Paridad × índice si no hay columna de precio para este ticker — repetir
+        # esa misma verificación acá (barata, ya cacheada por pandas) para saber
+        # de cuál de las dos salió el dato de ESTA ventana.
+        real_check = real_peso_price_series(df_norm, t, fx_diario, fecha_inicio, fecha_fin)
+        es_cotizacion_real[t] = real_check is not None and not real_check.empty
 
     piv_precio = pd.DataFrame(precios_semanales)
     if piv_precio.empty:
@@ -961,9 +990,25 @@ def extended_weekly_returns(port_df: pd.DataFrame, df_norm: pd.DataFrame, ticker
                 np.where(fechas < pd.Timestamp(primera_t), w_t, 0.0), index=fechas)
     ret_total = ret_total.where(peso_no_listado.reindex(ret_total.index) <= PESO_MIN_NO_LISTADO)
 
+    # Real vs. reconstruida: peso (ponderado) que esa semana salió de cotización
+    # real, sobre el peso total disponible esa semana. Mayoría (>=50%) → "real".
+    peso_real = pd.Series(0.0, index=fechas)
+    for t in bonos:
+        if not es_cotizacion_real.get(t, False) or t not in ret_bonos.columns:
+            continue
+        w_t = float(w_bonos.get(t, 0.0))
+        peso_real = peso_real + ret_bonos[t].notna().astype(float) * w_t
+    frac_real = (peso_real / peso_disponible.replace(0, np.nan)).fillna(0.0)
+    es_semana_real = frac_real.reindex(fechas) >= 0.5
+
+    validas = ret_total.reindex(fechas).notna()
+    n_reales = int((validas & es_semana_real).sum())
+    n_reconstruidas = int((validas & ~es_semana_real).sum())
+
     out = pd.DataFrame({"Date": fechas, "ret": ret_total.reindex(fechas).values,
-                         "peso_cubierto_pct": (peso_total_disponible.reindex(fechas) * 100).values})
-    return out, faltan, fecha_inicio
+                         "peso_cubierto_pct": (peso_total_disponible.reindex(fechas) * 100).values,
+                         "es_real": es_semana_real.values})
+    return out, faltan, fecha_inicio, n_reales, n_reconstruidas
 
 
 def objetivo_returns_from_semanal(semanal: pd.DataFrame, port_df: pd.DataFrame) -> pd.DataFrame:
@@ -1481,7 +1526,7 @@ with tab_hoy:
         k2.metric("Duration (MD) ponderada", f"{kpis_hoy['md_cartera']:.2f} años" if pd.notna(kpis_hoy['md_cartera']) else "—")
         k3.metric("Monto invertido (29/6)", fmt_ars(monto_compra))
         k4.metric("Valor actual (hoy)", fmt_ars(valor_actual_hoy),
-                  f"{resultado_pct_hoy:+.2f}% desde la compra" if pd.notna(resultado_pct_hoy) else None)
+                  f"{fmt_pct_signed(resultado_pct_hoy, 2)} desde la compra" if pd.notna(resultado_pct_hoy) else None)
         st.caption(f"Snapshot al {as_of_hoy.strftime('%d/%m/%Y')}" + (" (datos de ejemplo)" if modo_demo else "") +
                    f" · Compra simulada el {fecha_compra.strftime('%d/%m/%Y')}.")
 
@@ -1774,10 +1819,10 @@ with tab_bench:
             u = _u_hoy.iloc[0] if not _u_hoy.empty else ultimos.iloc[-1]
             _lbl = as_of_hoy.strftime("%d/%m/%Y")
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric(f"Cartera (acum. a hoy)", f"{cartera_acum_hoy:+.1f}%", help=f"Acumulado desde la compra hasta {_lbl} (mismo criterio que la pestaña principal y la tabla semanal).")
-            c2.metric(f"A3500 (acum. a hoy)", f"{u['idx_A3500'] - 100:+.1f}%")
-            c3.metric(f"CER (acum. a hoy)", f"{u['idx_CER'] - 100:+.1f}%" if pd.notna(u["idx_CER"]) else "—")
-            c4.metric(f"Benchmark compuesto (a hoy)", f"{u['idx_total_bench'] - 100:+.1f}%" if pd.notna(u["idx_total_bench"]) else "—")
+            c1.metric(f"Cartera (acum. a hoy)", fmt_pct_signed(cartera_acum_hoy), help=f"Acumulado desde la compra hasta {_lbl} (mismo criterio que la pestaña principal y la tabla semanal).")
+            c2.metric(f"A3500 (acum. a hoy)", fmt_pct_signed(u["idx_A3500"] - 100))
+            c3.metric(f"CER (acum. a hoy)", fmt_pct_signed(u["idx_CER"] - 100))
+            c4.metric(f"Benchmark compuesto (a hoy)", fmt_pct_signed(u["idx_total_bench"] - 100))
             st.caption(f"Acumulados medidos **a hoy ({_lbl})**, coherentes con la pestaña 'Cartera Hoy' y la "
                        f"tabla semanal. El tramo proyectado (a la derecha de 'Hoy' en el gráfico) no entra en "
                        f"estos números.")
@@ -1875,12 +1920,17 @@ with tab_bench:
                    "métrica de efectividad de cobertura, que es la que corresponde a ese mandato.")
 
         semanas_ext = st.slider("Semanas de historia para calcular estos ratios y la cobertura de Objetivo 2",
-                                 min_value=8, max_value=104, value=26, step=2,
+                                 min_value=8, max_value=104, value=8, step=2,
                                  help="Amplía la muestra hacia atrás usando una serie de PRECIO EN PESOS "
                                       "ajustado por indexación (FX/CER), ponderada por peso — SOLO para que "
                                       "estos indicadores tengan una base estadística más razonable que las "
                                       "pocas semanas reales desde la compra. Se usa tanto para los ratios de "
-                                      "Objetivo 1 como para el Hedge Ratio de Objetivo 2, más abajo.")
+                                      "Objetivo 1 como para el Hedge Ratio de Objetivo 2, más abajo. Default = "
+                                      "8 (el mínimo que el propio panel considera 'muestra utilizable') para "
+                                      "no arrancar con una ventana larga que mezcle de más semanas reconstruidas "
+                                      "(Paridad × índice) y muestre un Sharpe inflado antes de que lo revises. "
+                                      "Subilo si querés más muestra — solo mirá el desglose real/reconstruida "
+                                      "de abajo antes de confiar en el número.")
 
         obj1_tickers = port_df.loc[port_df["Objetivo"].str.startswith("1"), "Ticker"].tolist()
         obj2_tickers = port_df.loc[port_df["Objetivo"].str.startswith("2"), "Ticker"].tolist()
@@ -1897,7 +1947,7 @@ with tab_bench:
         fx_ext = df_bench_ext.dropna(subset=["A3500"]).set_index("Date")["A3500"] if "A3500" in df_bench_ext.columns else None
         cer_ext = df_bench_ext.dropna(subset=["CER"]).set_index("Date")["CER"] if "CER" in df_bench_ext.columns else None
 
-        ext_ret, ext_faltan, fecha_inicio_ext = extended_weekly_returns(
+        ext_ret, ext_faltan, fecha_inicio_ext, n_reales_ext, n_reconstruidas_ext = extended_weekly_returns(
             port_df, df_norm, obj1_tickers, as_of_hoy, semanas_ext, fx_diario=fx_ext, cer_diario=cer_ext)
         n_semanas_ext = int(ext_ret["ret"].notna().sum())
 
@@ -1935,13 +1985,31 @@ with tab_bench:
         so = sortino_ratio(merged_ext["ret"], rf_semanal)
         ir = information_ratio(merged_ext["ret"], merged_ext["ret_obj1_bench"])
 
+        # Umbral de alerta visual — mismo criterio que ya se explicaba en texto
+        # chico más abajo ("Sharpe > 2-3 es más artefacto de suavidad..."), ahora
+        # también como badge pegado al número para que no dependa de leer el
+        # párrafo de abajo.
+        SHARPE_UMBRAL_ALERTA = 2.5
+        _sh_alerta = "⚠️ posible artefacto de suavidad" if pd.notna(sh) and sh > SHARPE_UMBRAL_ALERTA else None
+        _so_alerta = "⚠️ posible artefacto de suavidad" if pd.notna(so) and so > SHARPE_UMBRAL_ALERTA else None
+
+        st.info(f"📊 **Composición de la muestra:** de las **{n_semanas_ext} semanas** usadas, "
+                f"**{n_reales_ext} son reales** (con cotización de mercado del propio período) y "
+                f"**{n_reconstruidas_ext} son reconstruidas** (Paridad × índice FX/CER — un supuesto, no "
+                f"un precio de mercado, para instrumentos que ya cotizaban antes de esta ventana pero sin "
+                f"columna de precio real en el dataset). Cuantas más semanas reconstruidas, más el Sharpe/"
+                f"Sortino de acá reflejan el supuesto de indexación en vez de precios de mercado observados.")
+
         r1, r2, r3, r4 = st.columns(4)
-        r1.metric(f"Sharpe (rf = TNA caución {tna_rf:.0f}%)", f"{sh:.2f}" if pd.notna(sh) else "—")
-        r2.metric(f"Sortino (rf = TNA caución {tna_rf:.0f}%)", f"{so:.2f}" if pd.notna(so) else "—")
+        r1.metric(f"Sharpe (rf = TNA caución {tna_rf:.1f}%)", f"{sh:.2f}" if pd.notna(sh) else "—",
+                  delta=_sh_alerta, delta_color="inverse")
+        r2.metric(f"Sortino (rf = TNA caución {tna_rf:.1f}%)", f"{so:.2f}" if pd.notna(so) else "—",
+                  delta=_so_alerta, delta_color="inverse")
         r3.metric("Information Ratio", f"{ir:.2f}" if pd.notna(ir) else "—")
-        r4.metric("N° semanas usadas", f"{n_semanas_ext}")
+        r4.metric("N° semanas usadas", f"{n_semanas_ext}",
+                  f"{n_reales_ext} reales · {n_reconstruidas_ext} reconstr.", delta_color="off")
         st.caption(f"Sharpe = (retorno medio semanal − rf semanal) ÷ desvío semanal, anualizado ×√52. La "
-                   f"tasa libre de riesgo es la TNA de la caución ({tna_rf:.0f}%) llevada a semanal "
+                   f"tasa libre de riesgo es la TNA de la caución ({tna_rf:.1f}%) llevada a semanal "
                    f"(rf_sem = {rf_semanal*100:.3f}%): se resta porque los retornos ya son nominales en "
                    f"pesos e incluyen la indexación FX/CER — con rf=0 el número se inflaba artificialmente. "
                    f"Sortino: igual, pero el desvío solo considera semanas por debajo de rf. Benchmark del "
@@ -1951,6 +2019,57 @@ with tab_bench:
                    "tienden a mostrar un Sharpe alto porque su volatilidad semanal subestima el riesgo real "
                    "(duration, crédito, liquidez, saltos de mercado que no se ven en la Paridad × índice). "
                    "Un Sharpe > 2-3 acá es más un artefacto de suavidad que una señal de calidad excepcional.")
+
+        # *** Cross-check DIARIO — para responder si conviene medir el desvío
+        # estándar sobre retornos diarios en vez de semanales. Reusa el mismo
+        # índice de precio ponderado (price_index_multi) que ya usa el Hedge
+        # Ratio diario, sobre días de cotización REAL (sin ffill ni grilla
+        # semanal) — así se puede comparar directamente si el Sharpe semanal de
+        # arriba es un artefacto de la agregación semanal o no. NO reemplaza el
+        # Sharpe semanal (que sigue siendo el que se usa arriba): es un chequeo
+        # adicional, mismo patrón que ya se usa para el Hedge Ratio.
+        primeras_obj1 = primer_dato_disponible(df_norm, obj1_tickers)
+        fechas_obj1_validas = [f for f in primeras_obj1.values() if f is not None]
+        if fechas_obj1_validas:
+            fecha_tope_obj1 = max(fechas_obj1_validas)
+            if modo_demo:
+                bench_obj1_diario_df = synthetic_benchmark_series(
+                    fecha_tope_obj1.strftime("%Y-%m-%d"), as_of_hoy.strftime("%Y-%m-%d"))
+                a3500_obj1_diario = bench_obj1_diario_df.set_index("Date")["A3500"]
+                cer_obj1_diario = bench_obj1_diario_df.set_index("Date")["CER"]
+            else:
+                # Serie fresca (no la 'cer_diario'/'fx_diario' global, que solo cubre desde
+                # la fecha de compra): acá la ventana arranca en fecha_tope_obj1, que puede
+                # ser bastante anterior — mismo criterio que ya usa el Hedge Ratio diario de
+                # Objetivo 2 con el A3500 (a3500_diario_df), extendido acá también al CER
+                # porque Objetivo 1 sí tiene un componente CER (TZXD6).
+                bench_obj1_diario_df = fetch_benchmark_bcra(fecha_tope_obj1.strftime("%Y-%m-%d"),
+                                                             as_of_hoy.strftime("%Y-%m-%d"))
+                a3500_obj1_diario = bench_obj1_diario_df.dropna(subset=["A3500"]).set_index("Date")["A3500"]
+                cer_obj1_diario = bench_obj1_diario_df.dropna(subset=["CER"]).set_index("Date")["CER"]
+            indice_obj1_diario = price_index_multi(port_df, df_norm, obj1_tickers, fecha_tope_obj1, as_of_hoy,
+                                                    fx_diario=a3500_obj1_diario, cer_diario=cer_obj1_diario)
+            ret_obj1_diario = indice_obj1_diario.pct_change(fill_method=None).dropna()
+            if len(ret_obj1_diario) >= 8:
+                rf_diaria = (1 + tna_rf / 100.0) ** (1 / 365.0) - 1
+                sh_d = sharpe_ratio(ret_obj1_diario, rf_diaria, periods_per_year=252)
+                so_d = sortino_ratio(ret_obj1_diario, rf_diaria, periods_per_year=252)
+                dd1, dd2, dd3 = st.columns(3)
+                dd1.metric("Sharpe DIARIO (cross-check, anualizado ×√252)",
+                           f"{sh_d:.2f}" if pd.notna(sh_d) else "—")
+                dd2.metric("Sortino DIARIO (cross-check)", f"{so_d:.2f}" if pd.notna(so_d) else "—")
+                dd3.metric("N° obs. diarias", f"{len(ret_obj1_diario)}")
+                st.caption(f"Mismo Sharpe/Sortino pero con desvío estándar sobre retornos **diarios** reales "
+                           f"(sin grilla semanal, sin ffill — mismo criterio que el Hedge Ratio β diario) en "
+                           f"vez de semanales, sobre {fecha_tope_obj1.strftime('%d/%m/%Y')} → "
+                           f"{as_of_hoy.strftime('%d/%m/%Y')}. Si este número da bien más bajo que el Sharpe "
+                           f"semanal de arriba, confirma que la agregación semanal subestima la volatilidad "
+                           f"real (el 'artefacto de suavidad'); si dan parecidos, el semanal ya es razonable. "
+                           f"Salvedad: acá la Caución/money-market queda afuera (no cotiza en el dataset, no "
+                           f"tiene 'días' propios) — el índice diario es Objetivo 1 renormalizado sobre los 5 "
+                           f"bonos, mientras el Sharpe semanal de arriba sí incluye el devengamiento de la "
+                           f"Caución. Con ~10% de peso y retorno casi sin volatilidad, no cambia la conclusión, "
+                           f"pero los dos números no son 100% comparables punto a punto.")
 
         st.divider()
         st.markdown("### 🛡️ Efectividad de Cobertura — Objetivo 2 y Cartera Total")
@@ -1984,8 +2103,8 @@ with tab_bench:
         st.markdown("*Cada bono con su propia ventana real (sin mezclar el hueco de datos de uno con el otro):*")
         filas_por_ticker = []
         for tk in obj2_tickers:
-            ret_tk, _, _ = extended_weekly_returns(port_df, df_norm, [tk], as_of_hoy, semanas_ext,
-                                                    fx_diario=fx_ext, cer_diario=cer_ext)
+            ret_tk, _, _, _, _ = extended_weekly_returns(port_df, df_norm, [tk], as_of_hoy, semanas_ext,
+                                                          fx_diario=fx_ext, cer_diario=cer_ext)
             merged_tk = ret_tk.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
             merged_tk["ret_A3500"] = merged_tk["A3500"].pct_change()
             validos_tk = merged_tk.dropna(subset=["ret"])
@@ -2144,7 +2263,7 @@ with tab_bench:
         else:
             st.info("Ningún ticker de Objetivo 2 tiene dato en el dataset — no se puede armar el análisis diario.")
 
-        ext_ret_obj2, ext_faltan_obj2, _ = extended_weekly_returns(
+        ext_ret_obj2, ext_faltan_obj2, _, _, _ = extended_weekly_returns(
             port_df, df_norm, obj2_tickers, as_of_hoy, semanas_ext, fx_diario=fx_ext, cer_diario=cer_ext)
         merged_obj2 = ext_ret_obj2.merge(bench_ext[["Date", "A3500"]], on="Date", how="left")
         merged_obj2["ret_A3500"] = merged_obj2["A3500"].pct_change()
